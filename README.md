@@ -1,23 +1,22 @@
 # Modelling Basics in RL for Sharp Lab
 
-**A collection of Python implementations contrasting Model-Based, Model-Free, and Successor Representation algorithms on sequential decision-making tasks.**
+**A Python implementation contrasting Model-Based, Model-Free, and Successor Representation algorithms on sequential decision-making tasks.**
 
-This repository contains simulations of classic behavioral tasks designed to tease apart different reinforcement learning strategies. The primary goal is to visualize and quantify how different agents (MB, MF, SR) succeed or fail under specific experimental manipulations, such as Reward Revaluation and Transition Revaluation.
+This repository contains a Jupyter Notebook simulation of the classic "Three-Branch" behavioral task (adapted from Momennejad et al., 2017). It is designed to visualize and quantify how different agents (MB, MF, SR) succeed or fail under specific experimental manipulations, specifically **Reward Revaluation** and **Transition Revaluation**.
 
 ## 📦 Contents
 
 1.  [Overview](https://www.google.com/search?q=%23-overview)
 2.  [Key Concepts](https://www.google.com/search?q=%23-key-concepts)
 3.  [Installation](https://www.google.com/search?q=%23-installation)
-4.  [Featured Task: Momennejad et al. (2017)](https://www.google.com/search?q=%23-featured-task-momennejad-et-al-2017)
-5.  [Other Algorithms & Tasks](https://www.google.com/search?q=%23-other-algorithms--tasks)
-6.  [References](https://www.google.com/search?q=%23-references)
+4.  [Featured Task: The Three-Branch Environment](https://www.google.com/search?q=%23-featured-task-the-three-branch-environment)
+5.  [References](https://www.google.com/search?q=%23-references)
 
 -----
 
 ## 🧠 Overview
 
-In biological and artificial reinforcement learning, "value" can be computed in multiple ways. This repository provides clean, readable Python code to simulate these strategies side-by-side. It is intended for:
+In biological and artificial reinforcement learning, "value" can be computed in multiple ways. This repository provides clean, readable Python code to simulate these strategies side-by-side in a single notebook. It is intended for:
 
   * Researchers in Computational Psychiatry and Neuroscience.
   * Students learning about the trade-offs between planning and habit.
@@ -25,10 +24,10 @@ In biological and artificial reinforcement learning, "value" can be computed in 
 
 ## 🔑 Key Concepts
 
-The repository focuses on three distinct agent architectures:
+The simulation focuses on three distinct agent architectures:
 
-  * **Model-Free (MF):** Learns policies by caching long-run values ($Q$) directly from reward prediction errors. It is computationally cheap but inflexible to sudden changes in the environment structure.
-  * **Model-Based (MB):** Learns a mental map of the world (Transitions $T$ and Rewards $R$). It computes values "on the fly" by simulating the future. It is flexible but computationally expensive.
+  * **Model-Free (MF):** Learns policies by caching long-run values ($Q$) directly from reward prediction errors (SARSA/Q-Learning). It is computationally cheap but inflexible to sudden changes in the environment structure.
+  * **Model-Based (MB):** Learns a mental map of the world (Transitions $T$ and Rewards $R$). It computes values "on the fly" via planning (Value Iteration). It is flexible but computationally expensive.
   * **Successor Representation (SR):** A hybrid approach. It learns the "predictive map" of future state occupancies ($M$) and combines it with rewards. It solves Reward Revaluation like an MB agent but fails Transition Revaluation like an MF agent.
 
 -----
@@ -40,64 +39,38 @@ Clone the repository and install the required dependencies.
 ```bash
 git clone https://github.com/yourusername/cognitive-rl-benchmarks.git
 cd cognitive-rl-benchmarks
-pip install -r requirements.txt
+pip install numpy pandas matplotlib seaborn jupyter
 ```
 
-**Requirements:**
+**How to Run:**
 
-  * `numpy`
-  * `pandas`
-  * `matplotlib`
-  * `seaborn`
-
------
-
-## 🏆 Featured Task: Momennejad et al. (2017)
-
-**File:** `momennejad_2017.py`
-
-This script reproduces the "Two-Step Revaluation Task" logic. It contrasts agents across three phases:
-
-1.  **Learning:** Agents learn the structure and reward locations.
-2.  **Reward Revaluation:** Agents are *told* (or shown in isolation) that the reward has moved to a new state.
-      * *Prediction:* MB and SR succeed; MF fails (needs experience).
-3.  **Transition Revaluation:** The path structure changes (e.g., the state that led to reward now leads to a loss), but the agent only sees the local change, not the full path.
-      * *Prediction:* MB succeeds; SR and MF fail (SR caches long-run path predictions which become stale).
-
-### Running the Simulation
+Open the notebook in Jupyter Lab or Notebook:
 
 ```bash
-python momennejad_2017.py
+jupyter notebook simulations_MB_SR_MF.ipynb
 ```
-
-*Outputs a seaborn point-plot comparing `p(Best Choice)` for all agents across phases.*
 
 -----
 
-## 📂 Other Algorithms & Tasks
+## 🏆 Featured Task: The Three-Branch Environment
 
-*The repository includes templates for other canonical tasks in the literature:*
+**File:** `simulations_MB_SR_MF.ipynb`
 
-### `daw_two_step.py`
+This notebook implements the environment, agents, and plotting logic in one place. It contrasts agents across four distinct phases:
 
-**The Daw (2011) Two-Step Task.**
+1.  **Latent Learning:** Agents explore the environment without reward to learn the structure (Transition Matrix $T$ or Successor Matrix $M$).
+2.  **Reward Learning:** Agents learn to navigate to a specific reward state.
+3.  **Reward Revaluation:** Agents are *told* (or shown in isolation) that the reward has moved to a new state.
+      * *Result:* MB and SR adapt immediately; MF fails (persists in old habit).
+4.  **Transition Revaluation:** The path structure changes (e.g., the path that used to lead to reward now leads to a loss), but the agent only sees the local change, not the full path.
+      * *Result:* MB adapts immediately; SR and MF fail (SR caches long-run path predictions which become stale).
 
-  * **Description:** A probabilistic task where transitions are either "Common" (70%) or "Rare" (30%).
-  * **Objective:** Distinguishes MB from MF based on how they update after "Rare" transitions. MB agents boost the action that *produced* the outcome (even if via a rare transition), while MF agents just boost the action they *took*.
+### Visualization
 
-### `tolman_detour.py`
+The notebook generates:
 
-**Tolman's Latent Learning & Detour.**
-
-  * **Description:** Agents explore a maze without reward. Later, a reward is introduced, or a barrier blocks the main path.
-  * **Objective:** Demonstrates the value of learning $T$ (transitions) without immediate $R$ (reward), a hallmark of Model-Based/Cognitive Map learning.
-
-### `linear_track_sr.py`
-
-**SR Fields in a Linear Track.**
-
-  * **Description:** Visualizes the Successor Representation matrix $M$ as "place fields" that skew backwards from the direction of travel.
-  * **Objective:** Visualizing how the SR matrix approximates Hippocampal place cell firing.
+1.  **Line Plots:** Showing learning curves (probability of optimal choice) during the Reward Learning phase.
+2.  **Bar Plots:** Comparing the "zero-shot" performance of agents immediately after Reward and Transition revaluation, highlighting the specific deficits of MF and SR agents.
 
 -----
 

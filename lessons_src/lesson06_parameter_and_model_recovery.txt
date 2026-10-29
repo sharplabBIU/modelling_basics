@@ -1,0 +1,479 @@
+# %% [markdown]
+# Lesson 6 — Trust but verify: parameter recovery, identifiability and model recovery
+
+In lesson 5 you learned how to find the parameter values that make a participant's choices most likely. Nothing in that procedure tells you whether those values *mean* anything. An optimiser always returns a number; the question is whether the number could have been recovered if the model were true, and whether the model could have been told apart from its rivals. This lesson is about the two simulation studies that answer those questions — **parameter recovery** and **model recovery** — and about what to do when the answer is no.
+
+These checks are rules 4–6 of Wilson and Collins' (2019) *Ten simple rules for the computational modeling of behavioral data*, and they are expected in any modelling paper. They are also cheap: everything you need is the simulation code from lesson 3 and the fitting code from lesson 5.
+
+**What you will learn**
+
+- why a good fit is not evidence that a model or its parameters are right,
+- how to run and read a parameter-recovery study (correlation, bias, scatter plots),
+- what *identifiability* and parameter trade-offs are, and how trial numbers and task design affect them,
+- how to run a model-recovery study and read confusion and inversion matrices,
+- a first *posterior predictive check*, the simplest way to falsify a model,
+- what to do when recovery fails.
+
+**Prerequisites:** lessons 3 and 5.
+
+**Estimated time:** 2.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 6.1 Why a good fit is not enough
+
+Maximum-likelihood fitting answers one question: *given this model, which parameter values make the data most probable?* It does not answer any of these:
+
+1. **Could the parameters be recovered at all?** If two different parameter combinations produce nearly the same choice probabilities, the data cannot tell them apart, and the fitted value is largely arbitrary. The parameters are then said to be **non-identifiable** (or to **trade off**).
+2. **Is there enough data?** With 50 trials, the estimation noise of a learning rate can be as large as the differences between participants you hope to measure.
+3. **Is the model right?** The best-fitting parameters of a wrong model describe nothing real — and a wrong model can still fit reasonably well.
+4. **Did the optimiser work?** Local minima and boundary estimates (lesson 5) produce confident-looking nonsense.
+
+The remedy for all four is the same habit that opened the course: **simulate**. If you simulate data from the model with known parameters and your pipeline cannot get those parameters back, it certainly cannot get them from real participants. If you simulate from rival models and your comparison cannot tell them apart, the comparison on real data is meaningless.
+
+This lesson therefore asks two questions of a modelling pipeline before it touches real data:
+
+- **Parameter recovery** — if the model were true, would we recover its parameters?
+- **Model recovery** — if one of the candidate models were true, would we identify which one?
+
+Palminteri, Wyart and Koechlin (2017) add a third, which we preview at the end: even the winning model should be **falsified** by checking that it reproduces the qualitative patterns in the data.
+
+## 6.2 Parameter recovery
+
+A parameter-recovery study has four steps:
+
+1. choose a range of plausible parameter values, covering what you expect in participants;
+2. for many simulated subjects, draw parameters from that range and **simulate** the task with them;
+3. **fit** the model to each simulated data set exactly as you will fit the real data;
+4. compare recovered and true values — a scatter plot, the correlation $r$ between them, and the mean **bias** (recovered − true).
+
+The simulation and the fit must use the same task (same number of trials, same reward probabilities, same reversals) as the real experiment, because recovery depends on all of them.
+
+### ✏️ Exercise 6.1 — Simulate, then fit *(coding)*
+
+Write the core of a recovery study: a function that simulates one RW + softmax agent with known `alpha` and `beta` on a two-armed bandit with reward probabilities `probs`, fits the RW model to the simulated choices with `fitting.fit_mle`, and returns the estimates `(alpha_hat, beta_hat)`. Use `models.simulate_rw_bandit` for the simulation and `models.nll_rw` as the likelihood, with parameter kinds `["unit", "pos"]` (lesson 5) and `n_starts` random restarts.
+
+# %% [exercise 6.1]
+def simulate_and_fit(alpha, beta, n_trials, rng, n_starts=3, probs=(0.7, 0.3)):
+    """Simulate one RW + softmax agent with known parameters, then fit the RW model to
+    the simulated choices.  Returns (alpha_hat, beta_hat)."""
+    sim = ...                                                    # <- simulate with models.simulate_rw_bandit
+    fit = ...                                                    # <- fitting.fit_mle(models.nll_rw, (choices, rewards), kinds, n_starts=..., rng=rng)
+    alpha_hat, beta_hat = ...                                    # <- the constrained estimates
+    return float(alpha_hat), float(beta_hat)
+
+check("6.1", simulate_and_fit)
+
+# %% [markdown]
+Now the study itself. We draw 30 subjects with learning rates spread over (0.05, 0.95) and inverse temperatures spread log-uniformly between 1 and 10 — a range that covers what is typically found in bandit tasks — simulate 150 trials each, and fit.
+
+# %%
+simulate_and_fit = use("6.1", simulate_and_fit)
+
+n_subjects, n_trials = 30, 150
+true_params = np.column_stack([rng.uniform(0.05, 0.95, n_subjects),                      # alpha
+                               np.exp(rng.uniform(np.log(1), np.log(10), n_subjects))])  # beta, log-uniform in [1, 10]
+recovered = np.zeros_like(true_params)
+for i in range(n_subjects):
+    recovered[i] = simulate_and_fit(true_params[i, 0], true_params[i, 1], n_trials, rng, n_starts=3)
+
+BETA_CAP = 100                                          # estimates above this are "boundary fits" (see below)
+boundary = recovered[:, 1] > BETA_CAP
+true_log = np.column_stack([true_params[:, 0], np.log(true_params[:, 1])])
+rec_log = np.column_stack([recovered[:, 0], np.log(np.minimum(recovered[:, 1], BETA_CAP))])
+
+axes = plotting.plot_parameter_recovery(true_log, rec_log, ["α", "log β"])
+axes[1].scatter(true_log[boundary, 1], rec_log[boundary, 1], marker="^", s=70, color="#e34948", zorder=3,
+                label=f"boundary fits (β̂ > {BETA_CAP}), clipped")
+axes[1].legend(fontsize=8, loc="lower right")
+plt.suptitle(f"Parameter recovery of the RW model ({n_subjects} simulated subjects, {n_trials} trials)", y=1.03)
+plt.show()
+print(f"{boundary.sum()} of {n_subjects} fits ran away to β̂ > {BETA_CAP}. Their true (α, β):")
+print(np.round(true_params[boundary], 2))
+
+# %% [markdown]
+Two things need explaining before the plot can be read.
+
+First, β is shown on a **log scale**. Its estimation error is multiplicative — an estimate of 2 for a true value of 4 is as bad as 8 for 4 — and log β is what the optimiser actually works with (the `"pos"` transform of lesson 5). Reporting recovery of log β is standard practice.
+
+Second, the red triangles. For a few simulated subjects the estimate of β **ran away** to enormous values (we clip them at 100 for plotting). These are agents with a high learning rate whose choices happened to be perfectly consistent with always picking the currently higher-valued option. For such data the likelihood keeps increasing as β grows — every increase makes the observed choices more probable — so the maximum lies at infinity. These **boundary fits** are a well-known pathology of maximum likelihood (the "β → ∞" pitfall of lesson 5) and the first thing to look for in any recovery study. They say nothing about β except "large", so below we **count them and exclude them** from the summary statistics. Lesson 8 shows how priors solve the problem properly.
+
+With that out of the way, read the plots like this:
+
+- Points on the dashed identity line are perfect recovery; the vertical scatter around it is **estimation noise**.
+- A tilt of the cloud away from the identity line is **bias**: in bandit tasks learning rates are typically compressed towards the middle of the range.
+- The **correlation** $r$ says whether participants would be *ranked* correctly. For individual-differences research (lesson 14) that is the quantity that matters most.
+
+### ✏️ Exercise 6.2 — Summarising a recovery study *(coding)*
+
+Write the function that produces the numbers behind the plot: for arrays `true` and `recovered` of shape `(n_subjects, n_params)`, return a dictionary with `"r"` — the Pearson correlation between true and recovered values of each parameter — and `"bias"` — the mean of recovered − true for each parameter. Both entries are arrays of length `n_params`.
+
+# %% [exercise 6.2]
+def recovery_summary(true, recovered):
+    """Per-parameter Pearson correlation and mean bias (recovered - true).
+    Returns {"r": array (n_params,), "bias": array (n_params,)}."""
+    true = np.asarray(true, dtype=float)
+    recovered = np.asarray(recovered, dtype=float)
+    n_params = true.shape[1]
+    r = np.zeros(n_params)
+    bias = np.zeros(n_params)
+    for j in range(n_params):
+        r[j] = ...                 # <- correlation between the j-th columns (np.corrcoef gives a 2x2 matrix)
+        bias[j] = ...              # <- mean of recovered − true for parameter j
+    return {"r": r, "bias": bias}
+
+check("6.2", recovery_summary)
+
+# %%
+recovery_summary = use("6.2", recovery_summary)
+
+ok = ~boundary
+summary = recovery_summary(true_log[ok], rec_log[ok])
+for j, name in enumerate(["alpha", "log beta"]):
+    print(f"{name:9s}  r = {summary['r'][j]:.2f}   bias = {summary['bias'][j]:+.2f}")
+print(f"(computed on the {ok.sum()} fits that did not run away)")
+
+# %% [markdown]
+### ✏️ Exercise 6.3 — Recovery correlation by hand *(maths)*
+
+Five simulated subjects gave the following true and recovered learning rates. Compute Pearson's $r$ between the two columns (by hand with the formula $r = \mathrm{cov}(x, y) / (s_x s_y)$, or in a code cell) and enter it with three decimals.
+
+| subject | true α | recovered α |
+|---|---|---|
+| 1 | 0.10 | 0.20 |
+| 2 | 0.30 | 0.25 |
+| 3 | 0.50 | 0.55 |
+| 4 | 0.70 | 0.60 |
+| 5 | 0.90 | 0.95 |
+
+# %% [exercise 6.3]
+answer = None   # <- your number
+check("6.3", answer)
+
+# %% [markdown]
+## 6.3 Identifiability and parameter trade-offs
+
+Why is recovery imperfect even with the true model and a working optimiser? Because different parameter combinations can produce similar behaviour. The clearest way to see it is to look at the likelihood surface of a single subject (lesson 5): instead of a sharp peak we often find a **ridge**, along which $\alpha$ and $\beta$ can be traded against each other with little change in likelihood.
+
+# %%
+subject = models.simulate_rw_bandit([0.7, 0.3], alpha=0.3, beta=5.0, n_trials=60, rng=rng)
+alphas = np.linspace(0.02, 0.98, 40)
+betas = np.linspace(0.5, 15, 40)
+ll_grid = -fitting.grid_nll(models.nll_rw, (subject["choices"], subject["rewards"]), [alphas, betas])
+fit = fitting.fit_mle(models.nll_rw, (subject["choices"], subject["rewards"]), ["unit", "pos"], n_starts=5, rng=rng)
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+cs = ax.contourf(betas, alphas, ll_grid, levels=30, cmap=plotting.SEQUENTIAL)
+plt.colorbar(cs, ax=ax, label="log-likelihood")
+ax.plot(5.0, 0.3, "*", color="#e34948", ms=14, label="true (α = 0.3, β = 5)")
+ax.plot(fit["params"][1], fit["params"][0], "o", color="#eda100", ms=9, label="maximum-likelihood estimate")
+ax.set(xlabel="β (inverse temperature)", ylabel="α (learning rate)", title="Log-likelihood surface of one subject (60 trials)")
+ax.legend(loc="upper right", fontsize=9)
+ax.grid(False)
+plt.show()
+
+# %% [markdown]
+The bright region is elongated along a diagonal: a higher learning rate with a lower inverse temperature produces choices that look much like a lower learning rate with a higher inverse temperature — both make the agent somewhat less consistent in choosing the better option. With few trials the estimate can land anywhere along the ridge.
+
+A second diagnostic uses the recovery study itself. The true parameters were drawn **independently**, so any correlation between the *recovered* α and log β must have been produced by the estimation — a tell-tale sign of a trade-off. (Boundary fits are excluded, as before.)
+
+# %%
+r_true = np.corrcoef(true_log[ok, 0], true_log[ok, 1])[0, 1]
+r_recovered = np.corrcoef(rec_log[ok, 0], rec_log[ok, 1])[0, 1]
+print(f"correlation between alpha and log(beta):  true parameters r = {r_true:+.2f},  recovered r = {r_recovered:+.2f}")
+
+# %% [markdown]
+The recovered parameters are negatively correlated although the true ones are not — the ridge of the likelihood surface, seen across subjects. With 150 trials the effect is modest; with fewer trials it grows.
+
+### What improves identifiability?
+
+A parameter is identifiable only to the extent that **changing it changes the predicted behaviour in this design**. Two things you control are the **number of trials** and the **task design**. The cell below repeats the recovery study for three trial numbers and for three bandit designs — an easy one (0.95 vs 0.05), the usual one (0.7 vs 0.3) and a hard one (0.55 vs 0.45) — counting boundary fits in each case.
+
+# %%
+def recovery_experiment(n_trials, probs, n_subjects=20, n_starts=2, beta_cap=100):
+    """Recovery correlations of alpha and log(beta) for one task configuration (boundary fits excluded)."""
+    true = np.column_stack([rng.uniform(0.05, 0.95, n_subjects), np.exp(rng.uniform(np.log(1), np.log(10), n_subjects))])
+    rec = np.array([simulate_and_fit(a, b, n_trials, rng, n_starts=n_starts, probs=probs) for a, b in true])
+    keep = rec[:, 1] <= beta_cap
+    true_l = np.column_stack([true[:, 0], np.log(true[:, 1])])
+    rec_l = np.column_stack([rec[:, 0], np.log(rec[:, 1])])
+    return recovery_summary(true_l[keep], rec_l[keep])["r"], int((~keep).sum())
+
+trial_numbers = [40, 120, 360]
+res_trials = [recovery_experiment(n, (0.7, 0.3)) for n in trial_numbers]
+designs = [(0.95, 0.05), (0.7, 0.3), (0.55, 0.45)]
+res_design = [recovery_experiment(150, p) for p in designs]
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.9), sharey=True)
+for ax, results, ticklabels, title in [(axes[0], res_trials, [f"{n} trials" for n in trial_numbers], "Trial number (0.7 vs 0.3 bandit)"),
+                                        (axes[1], res_design, [f"{a} vs {b}" for a, b in designs], "Task design (150 trials)")]:
+    x = np.arange(len(results))
+    ax.bar(x - 0.18, [r[0][0] for r in results], 0.36, label="α")
+    ax.bar(x + 0.18, [r[0][1] for r in results], 0.36, label="log β")
+    for xi, (r, n_boundary) in zip(x, results):
+        ax.text(xi, 1.02, f"{n_boundary} boundary fit{'s' if n_boundary != 1 else ''}", ha="center", fontsize=8, color="#52514e")
+    ax.set(xticks=x, xticklabels=ticklabels, title=title, ylim=(0, 1.12))
+    ax.grid(axis="x", visible=False)
+axes[0].set_ylabel("recovery correlation r")
+axes[0].legend(loc="lower right")
+plt.show()
+
+# %% [markdown]
+With only 20 simulated subjects per bar the exact numbers change from run to run — re-run the cell with another seed and look at the pattern, not the digits. Three lessons are robust:
+
+- **More trials help**, and not only by reducing noise: with 40 trials a sizeable fraction of the fits run away to the boundary, because short sequences are often perfectly consistent with a deterministic policy.
+- **A very easy task recovers the learning rate poorly.** Once the better option is obvious, the values stop changing in a way that depends on α and the choices saturate at the better option, so most trials carry no information about either parameter. Difficulty and informativeness are not the same thing.
+- **Moderate changes in reward probabilities matter less than you might expect.** In the 0.7/0.3 and 0.55/0.45 designs the reward noise keeps the values fluctuating, and those fluctuations keep both parameters identifiable.
+
+For other parameters the design is decisive: the model-based weight of the two-step task is identified only through rare transitions (lesson 9), learning-rate *adaptation* only through blocks that differ in volatility (lesson 12), and asymmetric learning rates only if both wins and losses occur often enough (lesson 13). The rule is always the same — simulate the design before running it, and check that the parameter you care about leaves a visible trace.
+
+### ✏️ Exercise 6.4 — When choices are deterministic *(conceptual)*
+
+A simulated participant's choices are perfectly consistent with always picking the option that currently has the higher value. What happens to the maximum-likelihood estimate of β, and why?
+
+**(a)** β̂ = 0: consistent choices mean there is no exploration to explain.
+**(b)** β̂ grows without bound: every increase in β makes the observed choices more probable, so the likelihood has no maximum at any finite value.
+**(c)** β̂ = 1, because the data are perfectly consistent with the model.
+**(d)** The optimiser returns its starting value, because β drops out of the likelihood when choices are deterministic.
+
+# %% [exercise 6.4]
+check("6.4", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 6.4 Model recovery
+
+Parameter recovery assumes the model is right. Usually we have several candidate models, and the question becomes whether the data could tell them apart. The procedure mirrors parameter recovery:
+
+1. for each candidate model, draw parameters and simulate many data sets;
+2. fit **every** candidate model to **every** data set;
+3. declare a winner per data set with a model-comparison criterion;
+4. tabulate how often each generating model was identified: the **confusion matrix**.
+
+The candidates here are four models of bandit behaviour from `models.MODEL_SPECS` (lesson 5): a no-learning **bias** model (one parameter), noisy **win-stay/lose-shift** (one parameter), **RW** (α, β) and **RW with choice stickiness** (α, β, κ).
+
+To declare a winner we cannot simply take the lowest negative log-likelihood: a model with more parameters always fits at least as well. The **Bayesian information criterion** (Schwarz, 1978) adds a penalty for complexity,
+
+$$
+\mathrm{BIC} = k \ln n + 2\,\mathrm{nll},
+$$
+
+where $k$ is the number of free parameters and $n$ the number of trials; the lowest BIC wins. Lesson 7 explains where this comes from and what the alternatives are — for now it is simply our rule.
+
+### ✏️ Exercise 6.5 — Picking the winning model with BIC *(coding)*
+
+`nlls` is a dictionary mapping model names (keys of `models.MODEL_SPECS`) to fitted negative log-likelihoods. Return the name of the model with the lowest BIC. The number of parameters of a model is the length of its parameter-name list, `models.MODEL_SPECS[name][1]`, and `fitting.bic(nll, k, n)` computes the criterion.
+
+# %% [exercise 6.5]
+def best_model_by_bic(nlls, n_trials):
+    """Return the name of the model with the lowest BIC.  nlls maps model names to fitted nll values."""
+    best_name, best_bic = None, np.inf
+    for name, nll in nlls.items():
+        k = ...                                  # <- number of free parameters of this model
+        value = ...                              # <- its BIC
+        if value < best_bic:
+            best_name, best_bic = name, value
+    return best_name
+
+check("6.5", best_model_by_bic)
+
+# %% [markdown]
+The model-recovery loop: 15 simulated data sets per generating model, 120 trials each, all four models fitted to each.
+
+# %%
+best_model_by_bic = use("6.5", best_model_by_bic)
+
+candidates = ["bias", "wsls", "rw", "rw_stick"]
+labels = {"bias": "bias", "wsls": "WSLS", "rw": "RW", "rw_stick": "RW+stick"}
+
+def sample_params(name, rng):
+    """Draw plausible generating parameters for each candidate model."""
+    beta = np.exp(rng.uniform(np.log(1), np.log(8)))
+    if name == "bias":
+        return (rng.uniform(0.2, 0.8),)
+    if name == "wsls":
+        return (rng.uniform(0.05, 0.4),)
+    if name == "rw":
+        return (rng.uniform(0.1, 0.9), beta)
+    if name == "rw_stick":
+        return (rng.uniform(0.1, 0.9), beta, rng.choice([-1, 1]) * rng.uniform(0.5, 2.0))
+
+def fit_all_models(choices, rewards, rng, names=candidates, n_starts=2):
+    """Fit every candidate model; return {name: nll}."""
+    nlls = {}
+    for name in names:
+        nll_fn, param_names, kinds = models.MODEL_SPECS[name]
+        nlls[name] = fitting.fit_mle(nll_fn, (choices, rewards), kinds, n_starts=n_starts, rng=rng)["nll"]
+    return nlls
+
+n_sims, n_trials_mr = 15, 120
+sim_labels, fit_labels = [], []
+for i_gen, gen_name in enumerate(candidates):
+    for _ in range(n_sims):
+        data = models.simulate_model(gen_name, sample_params(gen_name, rng), [0.7, 0.3], n_trials_mr, rng)
+        nlls = fit_all_models(data["choices"], data["rewards"], rng)
+        sim_labels.append(i_gen)
+        fit_labels.append(candidates.index(best_model_by_bic(nlls, n_trials_mr)))
+sim_labels, fit_labels = np.array(sim_labels), np.array(fit_labels)
+print("done:", len(sim_labels), "simulated data sets")
+
+# %% [markdown]
+### ✏️ Exercise 6.6 — The confusion matrix *(coding)*
+
+`sim_labels[i]` is the index of the model that generated data set *i* and `fit_labels[i]` the index of the model that won. Build the confusion matrix: rows index the generating model, columns the winning model, and each entry is the **proportion** of that row's data sets won by that column (every row sums to 1).
+
+# %% [exercise 6.6]
+def confusion_matrix(sim_labels, fit_labels, n_models):
+    """Rows = generating model, columns = best-fitting model, entries = proportions (rows sum to 1)."""
+    sim_labels = np.asarray(sim_labels, dtype=int)
+    fit_labels = np.asarray(fit_labels, dtype=int)
+    counts = np.zeros((n_models, n_models))
+    for s, f in zip(sim_labels, fit_labels):
+        ...                                     # <- count this data set
+    return ...                                  # <- normalise each row
+
+check("6.6", confusion_matrix)
+
+# %% [markdown]
+The confusion matrix answers *"if model i generated the data, which model wins?"*. With real data we face the reverse question — model j won; which model is likely to have generated the data? — which is answered by the **inversion matrix**: the same counts normalised by **column** instead of by row (Wilson & Collins, 2019). Both are shown below.
+
+# %%
+confusion_matrix = use("6.6", confusion_matrix)
+
+confusion = confusion_matrix(sim_labels, fit_labels, len(candidates))
+counts = confusion * n_sims                                    # equal numbers of simulations per generating model
+column_totals = counts.sum(axis=0, keepdims=True)
+inversion = np.divide(counts, column_totals, out=np.zeros_like(counts), where=column_totals > 0)
+
+names = [labels[c] for c in candidates]
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+plotting.plot_confusion(confusion, names, ax=axes[0], title="Confusion matrix  P(best fit | generating)")
+plotting.plot_confusion(inversion, names, ax=axes[1], title="Inversion matrix  P(generating | best fit)")
+axes[1].set(xlabel="model with the best fit", ylabel="model that generated the data")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+What to look for:
+
+- A strong **diagonal** in the confusion matrix means every model, when true, is identified. Off-diagonal mass shows which pairs are confusable here — typically RW and RW+stickiness, whose extra parameter can be "found" in data that do not contain it, and whose stickiness can be mimicked by a high learning rate.
+- The **inversion matrix** is what you need once you have a winner on real data: if RW+stickiness wins, how confident should you be that it generated the data?
+- The two matrices can differ substantially when some models win too often or too rarely; always report the one that answers your question, and ideally both.
+
+### ✏️ Exercise 6.7 — From confusion to inversion *(maths)*
+
+A model-recovery study simulated 20 data sets from each of three models A, B and C. The counts of winning models were:
+
+| generating ↓ · best fit → | A | B | C |
+|---|---|---|---|
+| **A** | 16 | 4 | 0 |
+| **B** | 2 | 14 | 4 |
+| **C** | 0 | 6 | 14 |
+
+Model B wins on your real data. According to this study, what is the probability that the data were generated by model B? Give three decimals.
+
+# %% [exercise 6.7]
+answer = None   # <- your number
+check("6.7", answer)
+
+# %% [markdown]
+### ✏️ Exercise 6.8 — Reading a confusion matrix *(conceptual)*
+
+In a confusion matrix, the entry in row RW and column RW+stickiness is 0.30. This means that ...
+
+**(a)** 30% of the data sets simulated from RW were best fit by RW+stickiness.
+**(b)** 30% of the data sets best fit by RW+stickiness were generated by RW.
+**(c)** RW+stickiness is the true model with probability 0.30.
+**(d)** RW+stickiness fits 30% worse than RW.
+
+# %% [exercise 6.8]
+check("6.8", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 6.5 A first posterior predictive check
+
+Recovery studies ask whether the pipeline works *when one of the candidates is true*. They cannot tell you whether any candidate resembles the real process. The tool for that is the **posterior predictive check**: simulate new data from the fitted model and compare summary statistics with those of the real data. Where the model cannot reproduce the data, it is falsified — and the discrepancy tells you what is missing (Palminteri et al., 2017).
+
+Here is a small demonstration with simulated "real" data. The participant below follows a noisy win-stay/lose-shift rule. We fit the RW model to these data — it fits respectably — and then ask whether the fitted RW model reproduces two basic statistics: the probability of repeating a choice after a win and after a loss.
+
+# %%
+def stay_after(choices, rewards):
+    """P(repeat the previous choice | previous trial rewarded) and (| previous trial unrewarded)."""
+    stay = choices[1:] == choices[:-1]
+    prev_reward = rewards[:-1]
+    return stay[prev_reward == 1].mean(), stay[prev_reward == 0].mean()
+
+participant = models.simulate_model("wsls", (0.1,), [0.7, 0.3], 200, rng)       # the "real" data
+fit = fitting.fit_mle(models.nll_rw, (participant["choices"], participant["rewards"]), ["unit", "pos"], n_starts=3, rng=rng)
+alpha_hat, beta_hat = fit["params"]
+print(f"RW fit: alpha = {alpha_hat:.2f}, beta = {beta_hat:.1f}, nll = {fit['nll']:.1f} "
+      f"(chance: {200 * np.log(2):.1f})")
+
+data_stats = stay_after(participant["choices"], participant["rewards"])
+sim_stats = np.array([stay_after(**{k: v for k, v in models.simulate_rw_bandit([0.7, 0.3], alpha_hat, beta_hat, 200, rng).items() if k != "Q"})
+                      for _ in range(200)])
+
+fig, ax = plt.subplots(figsize=(5.5, 3.8))
+x = np.arange(2)
+ax.bar(x - 0.18, data_stats, 0.36, color="#52514e", label="data")
+ax.bar(x + 0.18, sim_stats.mean(axis=0), 0.36, label="fitted RW model (simulated)",
+       yerr=np.abs(np.percentile(sim_stats, [2.5, 97.5], axis=0) - sim_stats.mean(axis=0)), capsize=4)
+ax.set(xticks=x, xticklabels=["after a win", "after a loss"], ylabel="P(repeat choice)", ylim=(0, 1.05),
+       title="Posterior predictive check: the RW fit misses lose-shift behaviour")
+ax.legend(loc="upper right", fontsize=9)
+ax.grid(axis="x", visible=False)
+plt.show()
+
+# %% [markdown]
+The fitted model captures win-stay behaviour but cannot produce the near-certain switching after a loss: with a learning rate close to 1 the chosen option's value falls to 0 after a loss, but the *other* option's stale value is often 0 as well, so the simulated agent switches only about half of the time. The RW model is falsified by a statistic it was never asked to fit — exactly the kind of check that a likelihood alone cannot provide. Lesson 7 returns to posterior predictive checks with the full comparison machinery.
+
+## 6.6 When recovery fails
+
+Poor recovery is not a verdict on your idea; it is a property of the **model–task–sample size** combination, and each of the three can be changed:
+
+- **More data per participant.** Estimation noise shrinks with the number of informative trials. Sometimes a second session is the answer.
+- **A more diagnostic task.** Add the manipulation that the parameter is *about*: reversals for learning rates, rare transitions for model-based control (lesson 9), volatility blocks for learning-rate adaptation (lesson 12). Avoid designs in which every parameter combination predicts near-random choices.
+- **A simpler or constrained model.** Fix parameters that trade off with the one you care about to a group value, or bound them to a plausible range.
+- **Hierarchical priors** (lesson 8). Group-level information regularises individual estimates and reduces noise — at the price of shrinkage towards the group mean, which must be understood rather than ignored.
+- **Re-check the optimiser.** More random restarts, better transforms, a grid search to initialise.
+
+Whatever you change, rerun the recovery study. And remember the asymmetry: good recovery is necessary, not sufficient — it shows the pipeline *could* work, not that the model is right.
+
+### ✏️ Exercise 6.9 — When recovery fails *(conceptual, written)*
+
+Parameter recovery for your model is poor (r ≈ 0.3 for the learning rate). Name at least two things you could do about it, and say why each helps. Write 2–4 sentences.
+
+# %% [exercise 6.9]
+check("6.9", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A maximum-likelihood fit tells you the most likely parameters *given the model*; it says nothing about whether those parameters are recoverable or whether the model is right.
+- **Parameter recovery**: simulate with known parameters, fit, and compare. Report the scatter plot, the correlation and the bias, for the task you actually ran.
+- Parameters **trade off** when different combinations produce similar behaviour (the likelihood ridge); more trials and designs in which the parameter leaves a visible trace make them identifiable. Watch for **boundary fits** (β → ∞), which signal data that are perfectly consistent with a deterministic policy.
+- **Model recovery**: simulate from every candidate, fit every candidate, and tabulate the winners. The confusion matrix conditions on the truth, the inversion matrix on the winner — the latter is what you need to interpret a real result.
+- A **posterior predictive check** compares simulated and real summary statistics and can falsify a model that fits well.
+- When recovery fails, change the data, the task, the model or the priors — not the interpretation.
+
+## What's next
+
+Lesson 7 takes up the question we postponed here: how to compare models properly — AIC, BIC, cross-validation, group-level Bayesian model selection with exceedance probabilities — and how to combine relative comparison with the absolute checks introduced in this lesson.
+
+## References
+
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547
+- Palminteri, S., Wyart, V., & Koechlin, E. (2017). The importance of falsification in computational cognitive modeling. *Trends in Cognitive Sciences, 21*(6), 425–433. https://doi.org/10.1016/j.tics.2017.03.011
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press.
+- Schwarz, G. (1978). Estimating the dimension of a model. *Annals of Statistics, 6*(2), 461–464. https://doi.org/10.1214/aos/1176344136
+- Katahira, K. (2015). The relation between reinforcement learning parameters and the influence of reinforcement history on choice behavior. *Journal of Mathematical Psychology, 66*, 59–69. https://doi.org/10.1016/j.jmp.2015.03.006
+- Eckstein, M. K., Wilbrecht, L., & Collins, A. G. E. (2021). What do reinforcement learning models measure? Interpreting model parameters in cognition and neuroscience. *Current Opinion in Behavioral Sciences, 41*, 128–137. https://doi.org/10.1016/j.cobeha.2021.06.004

@@ -1,0 +1,15 @@
+# student progress (per machine)
+.rlcourse_progress.json
+notebooks/.rlcourse_progress.json
+
+# executed copies produced by scripts/run_notebooks.py --save
+build/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.pytensor/
+.DS_Store

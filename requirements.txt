@@ -1,0 +1,19 @@
+# Core (everything in lessons 0-15 except the optional PyMC sections)
+numpy>=1.23
+scipy>=1.9
+matplotlib>=3.6
+pandas>=1.5
+jupyterlab>=3.5
+ipykernel>=6
+nbformat>=5.7
+nbclient>=0.7
+statsmodels>=0.14
+
+# Optional: full Bayesian (MCMC) sections of lessons 8 and 14
+pymc>=5.10
+arviz>=0.15
+numpyro>=0.13
+jax>=0.4
+
+# Optional: tests
+pytest>=7

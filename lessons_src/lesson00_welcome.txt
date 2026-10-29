@@ -1,0 +1,175 @@
+# %% [markdown]
+# Lesson 0 — Welcome, setup, and how the exercises work
+
+Welcome to *Reinforcement Learning for Computational Cognitive Science*: a hands-on course that takes you from "what is a model?" to fitting model-based, successor-representation, Bayesian and distributional reinforcement-learning models to behaviour and relating their parameters to psychopathology.
+
+This short lesson makes sure everything runs on your machine and shows you how the exercises give feedback.
+
+**What you will learn**
+
+- how the course is organised and which lessons depend on which,
+- how to run the notebooks,
+- how the three kinds of exercises (conceptual, maths, coding) are checked, and how hints and solutions are revealed.
+
+**Prerequisites:** basic Python (variables, lists, functions, `for` loops) and a little NumPy. Nothing else.
+
+**Estimated time:** 20 minutes.
+
+# %% [markdown]
+## 0.1 The map
+
+The course has 16 lessons in five parts. Each builds on the previous ones; the arrows below show the strongest dependencies.
+
+| Part | Lessons | What you can do afterwards |
+|---|---|---|
+| **A. Foundations** | 1 Thinking like a modeller · 2 Probability & Bayes | simulate a task and an agent; compute likelihoods and posteriors |
+| **B. Model-free RL** | 3 Rescorla–Wagner & softmax · 4 Temporal-difference learning | implement the delta rule, TD, SARSA, Q-learning, actor–critic; explain dopamine prediction errors |
+| **C. Fitting & comparing models** | 5 Maximum likelihood · 6 Parameter & model recovery · 7 Model comparison · 8 Bayesian estimation & hierarchical models | fit any trial-by-trial model to choices, validate the fit, compare models, build hierarchical models |
+| **D. Beyond model-free** | 9 Model-based RL & the two-step task · 10 The successor representation · 11 Bayesian learners (Kalman, change-points) · 12 Volatility & the VKF · 13 Distributional RL | implement and fit the representative models of each family |
+| **E. Computational psychiatry** | 14 Parameters & psychopathology · 15 Capstone project | relate model parameters to symptoms without fooling yourself |
+
+```
+1 → 2 → 3 → 4
+        3 → 5 → 6 → 7 → 8
+        4 → 9 → 10
+        2 → 11 → 12
+        3 → 13
+   5–8, 9, 12, 13 → 14 → 15
+```
+
+If you are in a hurry: lessons 1–3, 5–7 and 9 form a minimal core; everything else can be taken in any order after them.
+
+# %% [markdown]
+## 0.2 Running the course
+
+1. Install the dependencies once (from the repository root):
+
+```
+pip install -r requirements.txt
+```
+
+2. Start JupyterLab **from the repository root** and open the notebooks in the `notebooks/` folder:
+
+```
+jupyter lab
+```
+
+3. Run cells top to bottom with `Shift+Enter`. Every notebook starts with the same setup cell (below). It makes the course package `rlcourse` importable and fixes a random seed so that your results match the text.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+print("Everything imported. NumPy", np.__version__)
+
+# %% [markdown]
+If the cell above fails with `ModuleNotFoundError: No module named 'rlcourse'`, you started Jupyter in the wrong folder: the notebook must be opened from inside the repository (the `..` in `sys.path.insert(0, "..")` points at the repository root). Alternatively run `pip install -e .` once from the repository root.
+
+# %% [markdown]
+## 0.3 How exercises work
+
+Every exercise has an id like `3.1` (lesson 3, exercise 1) and is checked by calling
+
+```python
+check("3.1", your_answer)
+```
+
+There are three kinds of exercise, and you will meet all three in every lesson:
+
+| kind | what you pass to `check` | example |
+|---|---|---|
+| **conceptual** (multiple choice or a short written answer) | a letter, or a string | `check("3.3", "b")` |
+| **maths** (a number you derive by hand or compute) | a number | `check("3.2", 0.6)` |
+| **coding** (a function you write) | the function itself | `check("3.1", rw_update)` |
+
+The checker gives **gradual feedback**:
+
+1. A wrong answer gets a *diagnosis* of what probably went wrong (for example "your result has the opposite sign") and the **first hint**.
+2. A second wrong attempt gets a second hint; a third gets the last one.
+3. After the hints are used up, the **worked solution** is shown together with the mistakes students most often make.
+4. A correct answer gets a short explanation of *why* it is correct.
+
+You can also, at any time:
+
+```python
+hint("3.1")      # see the next hint without attempting
+reveal("3.1")    # show the solution (try first!)
+reset("3.1")     # forget your attempts
+progress()       # table of what you have done so far
+```
+
+Your attempts are saved in a small file (`.rlcourse_progress.json`) next to the notebooks, so you can close a notebook and continue later.
+
+**Honest advice.** The hints are designed so that you will usually get there without the solution. Reading a solution you have not struggled with teaches almost nothing — resist `reveal` until the checker offers it.
+
+# %% [markdown]
+### ✏️ Exercise 0.1 — What is a computational model of behaviour? *(conceptual)*
+
+Which statement best describes a computational model of behaviour as used in this course?
+
+**(a)** A statistical test that tells us whether two groups differ.
+**(b)** A set of equations that, given a participant's experiences, generates predictions (or probabilities) for what the participant will do next.
+**(c)** A neural network trained to classify participants.
+**(d)** A verbal theory about why people behave the way they do.
+
+Replace `None` with the letter of your answer and run the cell. (Try a wrong letter first, to see what feedback looks like!)
+
+# %% [exercise 0.1]
+check("0.1", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+### ✏️ Exercise 0.2 — A first number *(maths)*
+
+A participant was rewarded on 3 of 4 trials. What proportion of trials was rewarded? Enter the number (between 0 and 1).
+
+# %% [exercise 0.2]
+answer = None   # <- your number
+check("0.2", answer)
+
+# %% [markdown]
+### ✏️ Exercise 0.3 — A first function *(coding)*
+
+Complete the function so that it returns the proportion of rewarded trials in a list of 0/1 rewards. Replace the `...` placeholder, then run the cell: the checker calls your function on several inputs and compares the results with the reference solution.
+
+# %% [exercise 0.3]
+def proportion_rewarded(rewards):
+    """Return the proportion of trials on which a reward (1) was received."""
+    rewards = np.asarray(rewards, dtype=float)
+    return ...          # <- fill in (hint: a proportion is a sum divided by a count)
+
+check("0.3", proportion_rewarded)
+
+# %% [markdown]
+## 0.4 Using your own functions later in a lesson
+
+Many lessons build on the functions you write. So that a stuck exercise never blocks you, cells that depend on an earlier exercise call `use()`: it returns *your* function if it passes the check, and otherwise substitutes the course's reference implementation (and tells you so).
+
+# %%
+proportion_rewarded = use("0.3", proportion_rewarded)
+print("Proportion rewarded in [1, 0, 1, 1, 0]:", proportion_rewarded([1, 0, 1, 1, 0]))
+
+# %% [markdown]
+## 0.5 Your progress
+
+# %%
+progress()
+
+# %% [markdown]
+## Summary
+
+- The course package `rlcourse` provides tasks, reference models, fitting tools and the checker; every notebook starts with the same setup cell.
+- `check(id, answer)` grades conceptual, maths and coding exercises, with a diagnosis, up to three hints, and then the worked solution.
+- `use(id, fn)` lets you continue a lesson even when an exercise is unfinished.
+
+## What's next
+
+Lesson 1 introduces the central habit of the course: **simulate before you fit**. You will build a bandit task, make simple agents play it, and learn why that is the first step of any modelling project.
+
+## References
+
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547 — the paper whose workflow this course follows.
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.). MIT Press. http://incompleteideas.net/book/the-book-2nd.html — free online; the standard reference for the algorithms.

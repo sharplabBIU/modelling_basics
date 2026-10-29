@@ -1,0 +1,454 @@
+# %% [markdown]
+# Lesson 13 — Distributional reinforcement learning
+
+Every learner in this course so far has summarised an option by one number: its expected reward. That number is all a mean-tracking rule can produce, and for many purposes it is enough. But outcomes have a *spread*: an option that pays 0 or 1 with equal probability is not the same thing as one that always pays 0.5, even though their means coincide. Risk, variance, skew — the shape of the outcome distribution — matter for decisions, for mood, and, it turns out, for how dopamine neurons behave.
+
+**Distributional reinforcement learning** keeps a family of value predictors instead of one, each updated with a different balance of learning from good and bad surprises. Together they encode the whole distribution of rewards. The idea improved deep RL agents (Bellemare, Dabney & Munos, 2017) before Dabney et al. (2020) found its signature in the dopamine system — and its central ingredient, *asymmetric learning rates*, is a model you will meet again and again in computational psychiatry.
+
+**What you will learn**
+
+- why a single expected value is not enough, and what *expectiles* and *quantiles* add,
+- distributional TD learning with asymmetric learning rates: how a population of learners comes to encode a distribution,
+- how a distribution can be *decoded* from the learned values, and what Dabney et al. (2020) found in dopamine neurons,
+- quantile-regression TD as the alternative,
+- asymmetric learning in humans: optimism, risk sensitivity, affective bias, and their link to mood.
+
+**Prerequisites:** lessons 3–5 (Rescorla–Wagner, TD, maximum likelihood).
+
+**Estimated time:** 2 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 13.1 Beyond the mean
+
+Here are two options with the same expected reward and very different outcome distributions. A Rescorla–Wagner learner (lesson 3) converges to the same value for both.
+
+# %%
+n = 2000
+safe = np.full(n, 2.0)                                                          # always 2
+risky = np.where(rng.random(n) < 0.5, 0.0, 4.0)                                 # 0 or 4
+bimodal = np.where(rng.random(n) < 0.4, rng.normal(5.0, 0.5, n), rng.normal(1.0, 0.5, n))   # a skewed mixture
+
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.2), sharey=True)
+for ax, x, name in zip(axes, [safe, risky, bimodal], ["safe: always 2", "risky: 0 or 4", "mixture: mostly ~1, sometimes ~5"]):
+    ax.hist(x, bins=np.linspace(-1, 7, 33), density=True, edgecolor="white")
+    ax.axvline(x.mean(), color=plotting.PALETTE[7], ls="--", label=f"mean = {x.mean():.2f}")
+    ax.set(title=name, xlabel="reward"); ax.legend(fontsize=8)
+axes[0].set_ylabel("density")
+plt.show()
+
+# learn each option with the delta rule (the value keeps fluctuating with a constant learning rate, so we average it)
+for x, name in zip([safe, risky, bimodal], ["safe", "risky", "mixture"]):
+    V, values = 0.0, []
+    for r in x:
+        V = models.rw_update(V, r, 0.05)
+        values.append(V)
+    print(f"{name:8s}: RW value, averaged over the last 1000 trials = {np.mean(values[-1000:]):.2f}   (true mean {x.mean():.2f})")
+
+# %% [markdown]
+Why would an agent want more than the mean? Three reasons recur in the literature:
+
+1. **Decisions under risk.** Preferring a sure 2 over a 50/50 gamble on 0 or 4 (risk aversion) is impossible for a learner that cannot tell them apart; so is preferring the gamble. Niv et al. (2012) showed that people's choices — and striatal prediction-error signals — are risk-sensitive in exactly this way.
+2. **Better learning.** In machine learning, Bellemare, Dabney and Munos (2017) showed that learning the full distribution of returns (their C51 algorithm) makes deep RL agents learn faster and more stably; Dabney et al. (2018) did the same with quantiles (QR-DQN).
+3. **The brain seems to do it.** Dabney et al. (2020) found that dopamine neurons differ systematically in how they respond to positive and negative prediction errors — the signature of a distributional code (section 13.4).
+
+### ✏️ Exercise 13.1 — Why go beyond the mean? *(conceptual)*
+
+Option A always pays 0.5. Option B pays 1 with probability 0.5 and 0 otherwise. A learner that represents each option by a single expected value (lesson 3) ...
+
+**(a)** will, after enough trials, assign B a higher value because it sometimes pays 1
+**(b)** will assign both options the same value and therefore cannot represent that B is riskier
+**(c)** will assign A a higher value because its outcomes are less variable
+**(d)** cannot learn the value of B at all because its outcomes vary
+
+# %% [exercise 13.1]
+check("13.1", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 13.2 Expectiles: a family of "means"
+
+The mean of a distribution is the number $e$ that minimises the expected squared error $\mathbb E[(X - e)^2]$. Now weight the errors asymmetrically: count errors where the outcome lies *above* $e$ with weight $\tau$ and errors where it lies *below* with weight $1 - \tau$,
+
+$$
+e_\tau = \arg\min_e\; \mathbb E\Big[\,\big|\tau - \mathbb 1[X < e]\big|\,(X - e)^2\Big].
+$$
+
+The minimiser $e_\tau$ is the **$\tau$-expectile** (Newey & Powell, 1987). Setting the derivative to zero gives the balance condition
+
+$$
+\tau\,\mathbb E\big[(X - e_\tau)_+\big] = (1-\tau)\,\mathbb E\big[(e_\tau - X)_+\big],
+$$
+
+where $(\cdot)_+$ keeps the positive part. At $\tau = 0.5$ the two sides have equal weight and $e_{0.5}$ is the mean; $\tau > 0.5$ pulls the expectile up (an *optimistic* summary), $\tau < 0.5$ pulls it down (*pessimistic*). The family $\{e_\tau\}$ for $\tau \in (0, 1)$ characterises the whole distribution, just as the family of quantiles does.
+
+Quantiles are the analogous minimisers with the *absolute* error, $\mathbb E[|\tau - \mathbb 1[X<q]|\,|X - q|]$: the $\tau$-quantile $q_\tau$ is the value below which a fraction $\tau$ of the outcomes fall. The two families differ: quantiles depend only on the *ranks* of outcomes, expectiles also on their *distances*.
+
+# %%
+taus = np.linspace(0.02, 0.98, 49)
+exp_bimodal = [models.expectile(bimodal, t) for t in taus]
+q_bimodal = np.quantile(bimodal, taus)
+fig, ax = plt.subplots(figsize=(6.5, 3.6))
+ax.plot(taus, exp_bimodal, label="expectiles")
+ax.plot(taus, q_bimodal, label="quantiles")
+ax.axhline(bimodal.mean(), color="#52514e", ls="--", lw=1, label="mean")
+ax.set(xlabel="τ", ylabel="value", title="Expectiles and quantiles of the bimodal reward distribution")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+Quantiles jump across the gap between the two modes (almost no outcomes lie between 2 and 4), whereas expectiles move smoothly through it because every outcome's distance contributes.
+
+### ✏️ Exercise 13.2 — Computing an expectile *(coding)*
+
+Implement the $\tau$-expectile of a sample. The balance condition says that $e$ is a weighted mean of the samples with weights $\tau$ (above $e$) and $1-\tau$ (below $e$); since the weights depend on $e$, iterate the weighted mean until it converges (start from the ordinary mean).
+
+# %% [exercise 13.2]
+def expectile(samples, tau, n_iter=200):
+    """The tau-expectile of a sample (iterated re-weighted mean)."""
+    x = np.asarray(samples, float)
+    e = np.mean(x)
+    for _ in range(n_iter):
+        weights = ...                        # tau for samples above e, 1 - tau for samples below
+        e_new = ...                          # weighted mean
+        if abs(e_new - e) < 1e-12:
+            break
+        e = e_new
+    return float(e)
+
+check("13.2", expectile)
+
+# %% [markdown]
+### ✏️ Exercise 13.3 — An expectile by hand *(maths)*
+
+An option pays 1 with probability 0.5 and 0 otherwise. What is its $0.8$-expectile? (Use the balance condition; the answer is a number between 0 and 1.)
+
+# %% [exercise 13.3]
+answer = None   # <- your number
+check("13.3", answer)
+
+# %% [markdown]
+## 13.3 Learning expectiles with asymmetric learning rates
+
+Here is the key observation of Dabney et al. (2020). Take a delta-rule learner, but let it use one learning rate $\alpha^+$ when the prediction error is positive and another, $\alpha^-$, when it is negative:
+
+$$
+V \leftarrow V + \alpha^+\,\delta \;\;\text{if}\;\; \delta > 0, \qquad V \leftarrow V + \alpha^-\,\delta \;\;\text{if}\;\; \delta \le 0, \qquad \delta = R - V .
+$$
+
+Where does such a learner settle? At the fixed point the *expected* update is zero,
+
+$$
+\alpha^+\,\mathbb E\big[(R - V)_+\big] = \alpha^-\,\mathbb E\big[(V - R)_+\big],
+$$
+
+which is exactly the balance condition of the expectile with
+
+$$
+\tau = \frac{\alpha^+}{\alpha^+ + \alpha^-}.
+$$
+
+An optimistic learner ($\alpha^+ > \alpha^-$) converges to an expectile above the mean, a pessimistic one below it, and a *population* of learners with different asymmetries encodes the distribution of rewards. Only the ratio of the two learning rates sets the target; their sum sets the speed.
+
+### ✏️ Exercise 13.4 — Distributional TD with asymmetric learning rates *(coding)*
+
+`values`, `alpha_pos` and `alpha_neg` are arrays with one entry per predictor; `reward` is the reward received by all of them. Return the updated values.
+
+# %% [exercise 13.4]
+def expectile_td_update(values, reward, alpha_pos, alpha_neg):
+    """One distributional TD update: each predictor uses alpha_pos for positive errors, alpha_neg for negative ones."""
+    values = np.asarray(values, float)
+    delta = ...                              # prediction errors, one per predictor
+    lr = ...                                 # learning rate per predictor, depending on the sign of its error
+    return ...
+
+check("13.4", expectile_td_update)
+
+# %% [markdown]
+### ✏️ Exercise 13.5 — From learning rates to asymmetry *(maths)*
+
+A predictor has $\alpha^+ = 0.3$ and $\alpha^- = 0.1$. To which expectile (which $\tau$) does it converge?
+
+# %% [exercise 13.5]
+answer = None   # <- your number
+check("13.5", answer)
+
+# %% [markdown]
+### A population of predictors learns the distribution
+
+We now train 20 predictors on rewards drawn from the bimodal mixture of section 13.1. Their asymmetries $\tau_i$ are spread from 0.05 to 0.95; all have the same total learning rate $\alpha^+ + \alpha^- = 0.06$.
+
+# %%
+expectile_td_update = use("13.4", expectile_td_update)
+expectile = use("13.2", expectile)
+
+n_pred = 20
+taus_pop = np.linspace(0.05, 0.95, n_pred)
+alpha_pos = 0.06 * taus_pop                       # alpha_pos / (alpha_pos + alpha_neg) = tau
+alpha_neg = 0.06 * (1 - taus_pop)
+print("asymmetries recovered from the learning rates:", np.allclose(models.taus_from_alphas(alpha_pos, alpha_neg), taus_pop))
+
+n_learn = 3000
+rewards = np.where(rng.random(n_learn) < 0.4, rng.normal(5.0, 0.5, n_learn), rng.normal(1.0, 0.5, n_learn))
+V = np.full(n_pred, 3.0)
+history = np.zeros((n_learn + 1, n_pred)); history[0] = V
+for t, r in enumerate(rewards):
+    V = expectile_td_update(V, r, alpha_pos, alpha_neg)
+    history[t + 1] = V
+learned = history[-500:].mean(axis=0)              # average over the last 500 trials to smooth the fluctuations
+true_expectiles = np.array([expectile(bimodal, t) for t in taus_pop])
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+colors = plt.cm.Blues(np.linspace(0.3, 1.0, n_pred))
+for i in range(n_pred):
+    axes[0].plot(history[:, i], color=colors[i], lw=1)
+axes[0].set(xlabel="trial", ylabel="value", title="20 predictors with τ from 0.05 (light) to 0.95 (dark)")
+axes[1].plot(taus_pop, true_expectiles, "-", color="#52514e", label="true expectiles of the reward distribution")
+axes[1].plot(taus_pop, learned, "o", label="learned values")
+axes[1].set(xlabel="τ = α⁺ / (α⁺ + α⁻)", ylabel="value", title="Each predictor converges to its expectile")
+axes[1].legend(fontsize=8)
+plt.show()
+print(f"largest discrepancy between learned values and true expectiles: {np.abs(learned - true_expectiles).max():.2f}")
+
+# %% [markdown]
+### Reversal points
+
+Each predictor responds to a reward $R$ with a scaled prediction error, $\alpha^+ (R - V_i)$ or $\alpha^- (R - V_i)$. Plotted against reward size, every response crosses zero at the predictor's own value: its **reversal point**. Optimistic predictors (large $\tau$) have high reversal points, pessimistic ones low — the pattern Dabney et al. (2020) looked for in dopamine neurons.
+
+# %%
+R_grid = np.linspace(-1, 7, 200)
+fig, ax = plt.subplots(figsize=(7, 4))
+for i in range(0, n_pred, 3):
+    delta = R_grid - learned[i]
+    response = np.where(delta > 0, alpha_pos[i], alpha_neg[i]) * delta
+    ax.plot(R_grid, response, color=colors[i], label=f"τ = {taus_pop[i]:.2f}")
+    ax.plot(learned[i], 0, "o", color=colors[i])
+ax.axhline(0, color="#52514e", lw=0.8)
+ax.set(xlabel="reward R", ylabel="scaled prediction error", title="Responses of predictors with different asymmetries (dots: reversal points)")
+ax.legend(fontsize=8, ncol=2)
+plt.show()
+
+# %% [markdown]
+## 13.4 Decoding the distribution
+
+If the brain stores a set of expectiles, the reward distribution can be read back out. Dabney et al. (2020) did this by searching for a set of outcomes whose expectiles match the measured ones, i.e. by minimising the expectile loss summed over the measured $(\tau_i, e_i)$ pairs.
+
+### ✏️ Exercise 13.6 — The expectile loss *(coding)*
+
+Return the asymmetric squared loss $\mathbb E[\,|\tau - \mathbb 1[x < e]|\,(x - e)^2]$ of a candidate value $e$ for a sample: a weighted *mean* of squared errors with weight $\tau$ for samples above $e$ and $1 - \tau$ for samples below.
+
+# %% [exercise 13.6]
+def expectile_loss(e, samples, tau):
+    """Asymmetric squared loss whose minimiser is the tau-expectile."""
+    x = np.asarray(samples, float)
+    weights = ...
+    return float(...)
+
+check("13.6", expectile_loss)
+
+# %%
+expectile_loss = use("13.6", expectile_loss)
+
+e_grid = np.linspace(0, 6, 121)
+fig, ax = plt.subplots(figsize=(6.5, 3.4))
+for tau in [0.2, 0.5, 0.8]:
+    losses = [expectile_loss(e, bimodal, tau) for e in e_grid]
+    ax.plot(e_grid, losses, label=f"τ = {tau}  (minimum at {e_grid[np.argmin(losses)]:.2f})")
+ax.set(xlabel="candidate value e", ylabel="expectile loss", title="The τ-expectile minimises the asymmetric squared loss")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+`models.decode_distribution` performs the search: it adjusts a set of support points until their expectiles match the learned values. Here we decode the distribution from the 20 learned values and compare it with the rewards the predictors actually experienced.
+
+# %%
+decoded = models.decode_distribution(learned, taus_pop)
+fig, ax = plt.subplots(figsize=(7, 3.6))
+ax.hist(rewards, bins=np.linspace(-1, 7, 41), density=True, alpha=0.6, edgecolor="white", label="true reward distribution")
+ax.plot(decoded, np.full(len(decoded), -0.02), "|", ms=18, color=plotting.PALETTE[7], label="decoded support points")
+ax.set(xlabel="reward", ylabel="density", title="The reward distribution decoded from 20 learned expectiles")
+ax.legend()
+plt.show()
+print(f"fraction of decoded points above 3: {np.mean(decoded > 3):.2f}   (true probability of the high mode: 0.40)")
+
+# %% [markdown]
+### What Dabney et al. (2020) found in dopamine neurons
+
+Recording from dopamine neurons in the ventral tegmental area of mice that received rewards of variable size, Dabney and colleagues tested three predictions of this scheme:
+
+1. **Diversity of asymmetry.** Across neurons, the slope of the response to positive prediction errors relative to negative ones varied widely and reliably — some neurons behaved like optimistic predictors (large $\tau$), others like pessimistic ones. The classic theory, in which every neuron reports the same prediction error relative to the mean, predicts no such diversity.
+2. **Ordered reversal points.** Each neuron's reversal point — the reward size at which its response switched from a dip to a burst — was measured independently of its asymmetry, and the two were positively correlated, as they must be if each neuron encodes a different expectile.
+3. **Decodable distribution.** Treating the reversal points as expectiles with the measured asymmetries, the distribution of rewards used in the task could be decoded from the population, including its multimodal shape.
+
+Lowet et al. (2020) review this and later evidence, and the open questions: how the asymmetries arise, how downstream circuits read the code, and what it is used for.
+
+### ✏️ Exercise 13.7 — The dopamine evidence *(conceptual)*
+
+Which finding of Dabney et al. (2020) supports a distributional code in dopamine neurons?
+
+**(a)** All dopamine neurons respond identically to reward prediction errors, as the classic theory predicts.
+**(b)** Different neurons scale positive and negative prediction errors differently, and the reward size at which each neuron's response flips sign (its reversal point) is ordered by that asymmetry — as expected if each neuron encodes a different expectile.
+**(c)** Dopamine neurons fire in proportion to the variance of the reward distribution.
+**(d)** Dopamine neurons respond to rewards but never to reward omissions.
+
+# %% [exercise 13.7]
+check("13.7", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 13.5 The quantile alternative
+
+Expectiles are not the only option. Dabney et al. (2018) trained deep RL agents to learn **quantiles** of the return with a different update: each predictor moves up by a fixed step $\alpha\tau_i$ when the reward exceeds it and down by $\alpha(1 - \tau_i)$ when it does not,
+
+$$
+V_i \leftarrow V_i + \alpha\,\big(\tau_i - \mathbb 1[R < V_i]\big).
+$$
+
+The step does not scale with the size of the error — only its sign matters — and the expected step is zero exactly when $P(R < V_i) = \tau_i$, the definition of the $\tau_i$-quantile.
+
+### ✏️ Exercise 13.8 — Quantile-regression TD *(coding)*
+
+Implement the update for an array of predictors with asymmetries `taus` and a common step size `alpha`.
+
+# %% [exercise 13.8]
+def quantile_td_update(values, reward, alpha, taus):
+    """Quantile-regression TD: v_i += alpha * (tau_i - 1[reward < v_i])."""
+    values = np.asarray(values, float)
+    taus = np.asarray(taus, float)
+    indicator = ...                          # 1.0 where the reward is below the value, else 0.0
+    return ...
+
+check("13.8", quantile_td_update)
+
+# %%
+quantile_td_update = use("13.8", quantile_td_update)
+
+Q = np.full(n_pred, 3.0)
+for r in rewards:
+    Q = quantile_td_update(Q, r, 0.02, taus_pop)
+fig, ax = plt.subplots(figsize=(6.5, 3.6))
+ax.plot(taus_pop, np.quantile(bimodal, taus_pop), "-", color="#52514e", label="true quantiles")
+ax.plot(taus_pop, Q, "s", color=plotting.PALETTE[1], label="quantile learners")
+ax.plot(taus_pop, true_expectiles, "--", color="#52514e", alpha=0.5, label="true expectiles")
+ax.plot(taus_pop, learned, "o", color=plotting.PALETTE[0], label="expectile learners")
+ax.set(xlabel="τ", ylabel="value", title="Quantile and expectile learners after 3000 trials")
+ax.legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+Both populations describe the same distribution in different coordinates. The expectile code matched the dopamine data better (Dabney et al., 2020), but the question of which code the brain uses, and where, is open (Lowet et al., 2020).
+
+## 13.6 Asymmetric learning in humans
+
+A population of asymmetric learners is a theory of neural coding; a *single* asymmetric learner is a theory of individual differences. When a Rescorla–Wagner model with separate learning rates $\alpha^+$ and $\alpha^-$ is fitted to human choices, the asymmetry is usually not zero:
+
+- **Optimistic learning.** Lefebvre et al. (2017) found $\alpha^+ > \alpha^-$ in most participants of a bandit task — a bias that inflates the value of chosen options — and traced it to the striatum. Palminteri and Lebreton (2022) review how such positivity and confirmation biases arise and what they do to behaviour.
+- **Risk sensitivity.** Niv et al. (2012) showed that asymmetric learning rates implement risk-sensitive values (exactly the expectile logic above) and explain both risk-averse choices and the asymmetry of striatal prediction-error signals.
+- **Affective bias as adaptation.** Pulcu and Browning (2017) showed that asymmetric learning rates are the *rational* response to environments in which rewards and punishments have different statistics, so a learning-rate asymmetry can be a well-calibrated adaptation rather than a flaw; the clinical question is whether patients' asymmetries fit their environment.
+- **Mood.** Eldar et al. (2016) propose that mood tracks the recent history of prediction errors and feeds back on how outcomes are perceived — one route by which an asymmetry in learning and a persistent mood could reinforce each other.
+
+From the distributional perspective all of these are statements about *where in the reward distribution* a person's value estimate sits: $\tau = \alpha^+/(\alpha^+ + \alpha^-)$ measures optimism directly.
+
+### ✏️ Exercise 13.9 — A single asymmetric learner over trials *(coding)*
+
+Return the value of a single asymmetric learner before each trial (and after the last one), as an array of length `len(rewards) + 1` starting at `v0`.
+
+# %% [exercise 13.9]
+def asymmetric_value_trajectory(rewards, alpha_pos, alpha_neg, v0=0.5):
+    """Values of a single learner with asymmetric learning rates (length n + 1, starting at v0)."""
+    rewards = np.asarray(rewards, float)
+    raise NotImplementedError("your code here: the RW loop of lesson 3 with one `if` on the sign of the error")
+
+check("13.9", asymmetric_value_trajectory)
+
+# %%
+asymmetric_value_trajectory = use("13.9", asymmetric_value_trajectory)
+
+coin = (rng.random(600) < 0.5).astype(float)             # rewards of 0 or 1, each with probability 0.5
+fig, ax = plt.subplots(figsize=(8, 3.6))
+for a_pos, a_neg in [(0.3, 0.1), (0.2, 0.2), (0.1, 0.3)]:
+    tau = models.taus_from_alphas(a_pos, a_neg)
+    traj = asymmetric_value_trajectory(coin, a_pos, a_neg, v0=0.5)
+    ax.plot(traj, lw=1, label=f"α⁺ = {a_pos}, α⁻ = {a_neg}  →  τ = {tau:.2f}, mean value = {traj[200:].mean():.2f}")
+    ax.axhline(tau, color="#52514e", lw=0.6, ls=":")
+ax.set(xlabel="trial", ylabel="value", ylim=(0, 1), title="Single asymmetric learners on a 50/50 reward (dotted: the expectile τ)")
+ax.legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+Each learner fluctuates around its expectile — $\tau$ itself for a 50/50 outcome of 0 or 1 (Exercise 13.3). The optimist "believes" the option pays 75% of the time.
+
+### Asymmetric learning rates in a (simulated) clinical sample
+
+The data set `bandit_anhedonia` contains 80 simulated participants on a two-armed bandit with one reversal, generated by the asymmetric RW model, together with an anhedonia score. We fit the model (`models.nll_rw_asym`, parameters `(alpha_pos, alpha_neg, beta)`) to 20 of them and look at how the asymmetry $\tau$ relates to the score — a first glimpse of the analyses of lesson 14.
+
+# %%
+from rlcourse import datasets
+trials, subjects = datasets.load("bandit_anhedonia")
+print(datasets.describe("bandit_anhedonia"))
+
+fits = []
+with np.errstate(over="ignore"):                  # some random starting points are extreme; the optimiser moves away from them
+    for s in range(20):
+        d = trials[trials.subject == s]
+        f = fitting.fit_mle(models.nll_rw_asym, (d.choice.to_numpy(), d.reward.to_numpy().astype(float)),
+                            ["unit", "unit", "pos"], n_starts=3, rng=rng)
+        fits.append(f["params"])
+fits = np.array(fits)
+tau_fit = models.taus_from_alphas(fits[:, 0], fits[:, 1])
+score = subjects.anhedonia.to_numpy()[:20]
+
+fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.6))
+axes[0].scatter(fits[:, 1], fits[:, 0], s=30)
+axes[0].plot([0, 1], [0, 1], ls="--", color="#52514e", lw=1)
+axes[0].set(xlabel="fitted α⁻", ylabel="fitted α⁺", title="Fitted learning rates (20 participants)")
+axes[1].scatter(score, tau_fit, s=30)
+axes[1].axhline(0.5, color="#52514e", lw=0.8, ls=":")
+axes[1].set(xlabel="anhedonia score", ylabel="asymmetry τ = α⁺/(α⁺+α⁻)", title=f"Optimism vs anhedonia  (r = {np.corrcoef(score, tau_fit)[0, 1]:.2f})")
+plt.show()
+
+# %% [markdown]
+In these simulated participants higher anhedonia tends to go with a smaller positive learning rate and therefore a more pessimistic $\tau$ — the relation built into the data set, inspired by (but not a replication of) the literature on reward learning and anhedonia (Huys et al., 2013). With 20 participants the correlation is weak and noisy, and notice the participant whose fit ran to the boundary ($\alpha^+ = 0$, $\tau = 0$): maximum-likelihood estimates do this with little data, which is one reason to use the priors of lesson 8. Lesson 14 shows how to test such a relation properly: with all participants, with recovery and reliability checks, and with the confounds between $\alpha^+$, $\alpha^-$ and $\beta$ in mind.
+
+### ✏️ Exercise 13.10 — Asymmetric learning, expectiles and mood *(conceptual, written)*
+
+In 3–5 sentences: how does the distributional (expectile) view explain what a person with $\alpha^+ > \alpha^-$ ends up believing about an option, and why might this matter for mood or psychopathology?
+
+# %% [exercise 13.10]
+check("13.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A mean-tracking learner cannot represent risk; options with equal means but different spreads get the same value.
+- **Expectiles** generalise the mean with asymmetric squared errors; **quantiles** do the same with absolute errors. Each family characterises the whole distribution.
+- A delta-rule learner with learning rates $\alpha^+$ and $\alpha^-$ converges to the expectile with $\tau = \alpha^+ / (\alpha^+ + \alpha^-)$; a population of such learners encodes the reward distribution, which can be decoded by minimising the expectile loss.
+- Dabney et al. (2020) found the three signatures of this code in dopamine neurons: diverse asymmetries, reversal points ordered by asymmetry, and a decodable reward distribution.
+- Quantile-regression TD moves each predictor by a fixed step whose sign depends on whether the reward exceeded it.
+- In humans, asymmetric learning rates measure optimism, risk sensitivity and affective bias; they can be rational adaptations, and they are a central model in computational psychiatry.
+
+## What's next
+
+Lesson 14 takes the models of lessons 9–13 to (simulated) clinical data: how to relate fitted parameters such as $w$, the learning-rate adaptation and $\tau$ to symptom scores, and how to avoid the mistakes that make such correlations meaningless.
+
+## References
+
+- Bellemare, M. G., Dabney, W., & Munos, R. (2017). A distributional perspective on reinforcement learning. *Proceedings of the 34th International Conference on Machine Learning (PMLR 70)*, 449–458.
+- Dabney, W., Rowland, M., Bellemare, M. G., & Munos, R. (2018). Distributional reinforcement learning with quantile regression. *Proceedings of the AAAI Conference on Artificial Intelligence, 32*(1).
+- Dabney, W., Kurth-Nelson, Z., Uchida, N., Starkweather, C. K., Hassabis, D., Munos, R., & Botvinick, M. (2020). A distributional code for value in dopamine-based reinforcement learning. *Nature, 577*, 671–675. https://doi.org/10.1038/s41586-019-1924-6
+- Eldar, E., Rutledge, R. B., Dolan, R. J., & Niv, Y. (2016). Mood as representation of momentum. *Trends in Cognitive Sciences, 20*(1), 15–24. https://doi.org/10.1016/j.tics.2015.07.010
+- Huys, Q. J. M., Pizzagalli, D. A., Bogdan, R., & Dayan, P. (2013). Mapping anhedonia onto reinforcement learning: A behavioural meta-analysis. *Biology of Mood & Anxiety Disorders, 3*, 12. https://doi.org/10.1186/2045-5380-3-12
+- Lefebvre, G., Lebreton, M., Meyniel, F., Bourgeois-Gironde, S., & Palminteri, S. (2017). Behavioural and neural characterization of optimistic reinforcement learning. *Nature Human Behaviour, 1*, 0067. https://doi.org/10.1038/s41562-017-0067
+- Lowet, A. S., Zheng, Q., Matias, S., Drugowitsch, J., & Uchida, N. (2020). Distributional reinforcement learning in the brain. *Trends in Neurosciences, 43*(12), 980–997. https://doi.org/10.1016/j.tins.2020.09.004
+- Newey, W. K., & Powell, J. L. (1987). Asymmetric least squares estimation and testing. *Econometrica, 55*(4), 819–847. https://doi.org/10.2307/1911031
+- Niv, Y., Edlund, J. A., Dayan, P., & O'Doherty, J. P. (2012). Neural prediction errors reveal a risk-sensitive reinforcement-learning process in the human brain. *Journal of Neuroscience, 32*(2), 551–562. https://doi.org/10.1523/JNEUROSCI.5498-10.2012
+- Palminteri, S., & Lebreton, M. (2022). The computational roots of positivity and confirmation biases in reinforcement learning. *Trends in Cognitive Sciences, 26*(7), 607–621. https://doi.org/10.1016/j.tics.2022.04.005
+- Pulcu, E., & Browning, M. (2017). Affective bias as a rational response to the statistics of rewards and punishments. *eLife, 6*, e27879. https://doi.org/10.7554/eLife.27879

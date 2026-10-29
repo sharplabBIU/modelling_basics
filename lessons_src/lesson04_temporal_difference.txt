@@ -1,0 +1,566 @@
+# %% [markdown]
+# Lesson 4 — Model-free learning II: temporal-difference learning, control and dopamine
+
+In lesson 3 the reward arrived immediately after the choice. Most of life is not like that: you choose a route, walk for ten minutes, and only then find out whether the café is open. How can a learner assign credit to a choice whose consequences arrive several steps later? **Temporal-difference (TD) learning** (Sutton, 1988) answers this with one small change to the Rescorla–Wagner rule: compare a prediction not with the reward alone but with the reward *plus the prediction made at the next step*. That change lets values propagate backwards through time, turns the delta rule into a way of learning to *act* in sequential tasks and — remarkably — reproduces the firing of midbrain dopamine neurons (Schultz, Dayan & Montague, 1997).
+
+**What you will learn**
+
+- the vocabulary of sequential tasks: Markov decision processes, returns, the discount factor $\gamma$, value functions and the Bellman equation,
+- TD(0) prediction and the idea of *bootstrapping*,
+- why TD errors look like dopamine responses, by reproducing the three classic recordings,
+- how to learn to act: SARSA and Q-learning, and the difference between on-policy and off-policy learning,
+- eligibility traces (TD($\lambda$)) and the actor–critic architecture, with its mapping onto the basal ganglia.
+
+**Prerequisites:** lesson 3.
+
+**Estimated time:** 2.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 4.1 From bandits to sequences
+
+A **Markov decision process** (MDP) is the standard description of a sequential task. At each step the agent is in a *state* $s$, takes an *action* $a$, receives a *reward* $r$ and moves to a new state $s'$ with probability $P(s' \mid s, a)$. *Markov* means that the next state and reward depend only on the current state and action, not on the longer history — the state summarises everything that matters. A bandit is the degenerate case with a single state that the agent never leaves.
+
+The agent's goal is no longer the next reward but the **return**, the (discounted) sum of all the rewards that follow:
+
+$$
+G_t = r_{t+1} + \gamma\, r_{t+2} + \gamma^2 r_{t+3} + \dots = \sum_{k=0}^{\infty} \gamma^k\, r_{t+k+1},
+$$
+
+where the **discount factor** $0 \le \gamma \le 1$ makes rewards that arrive later count less. With $\gamma = 1$ all future rewards count equally (fine for tasks that end, such as a maze run); with $\gamma < 1$ the agent is impatient, and its effective horizon is about $1/(1-\gamma)$ steps.
+
+In the course package an MDP is a `tasks.MDP` object with a transition tensor `P[s, a, s']`, a reward `R[s']` received *on entering* a state, and a list of terminal states. `tasks.random_walk_chain()` builds the random-walk example of Sutton & Barto (2018, Example 6.2): five states in a row, labelled A–E, with an exit at each end. The agent starts in the middle and moves left or right at random; leaving through the right-hand exit pays 1, through the left-hand exit nothing.
+
+# %%
+chain = tasks.random_walk_chain()
+print("states:", chain.names, "   terminal:", [n for n, t in zip(chain.names, chain.terminal) if t])
+print("P(s' | s = C, action = right):", chain.P[3, 1])
+print("reward on entering each state:", chain.R)
+
+# one episode under a random policy
+s = chain.reset(rng)
+visited, rewards, done = [chain.names[s]], [], False
+while not done:
+    s, r, done = chain.step(rng.integers(chain.n_actions), rng)    # a random action
+    visited.append(chain.names[s]); rewards.append(r)
+gamma = 0.9
+print("episode:", " → ".join(visited), "  rewards:", rewards)
+print(f"discounted return from the start (γ = {gamma}):", round(sum(gamma**k * r for k, r in enumerate(rewards)), 4))
+
+# %% [markdown]
+### ✏️ Exercise 4.1 — A discounted return *(maths)*
+
+An agent receives the rewards $0, 0, 1$ on the next three steps and nothing afterwards. With $\gamma = 0.9$, what is the return $G$ counted from before the first of these rewards? (The first reward is not discounted.)
+
+# %% [exercise 4.1]
+answer = None   # <- your number
+check("4.1", answer)
+
+# %% [markdown]
+## 4.2 Value functions and the Bellman equation
+
+The **value** of a state under a policy $\pi$ (the rule that selects actions) is the expected return from that state:
+
+$$
+V^\pi(s) = \mathbb{E}\big[\, G_t \mid s_t = s \,\big].
+$$
+
+Values obey a self-consistency relation discovered by Richard Bellman: the value of a state equals the expected immediate reward plus the discounted value of the state that follows,
+
+$$
+V^\pi(s) = \mathbb{E}\big[\, r_{t+1} + \gamma\, V^\pi(s_{t+1}) \mid s_t = s \,\big], \qquad V^\pi(\text{terminal}) = 0 .
+$$
+
+This **Bellman equation** is the heart of everything that follows: it says that a long-run quantity (the return) can be computed from *one step* of experience plus the value of where you land. For the three-state chain A–B–C under a random policy with $\gamma = 1$ it reads
+
+$$
+V(A) = \tfrac12 \cdot 0 + \tfrac12 V(B), \qquad
+V(B) = \tfrac12 V(A) + \tfrac12 V(C), \qquad
+V(C) = \tfrac12 V(B) + \tfrac12 \cdot 1,
+$$
+
+whose solution is $V = (0.25,\ 0.5,\ 0.75)$: the closer to the rewarded exit, the more valuable the state. When the transition probabilities are known, the Bellman equation is a linear system we can solve directly — this is what a *model-based* agent does (lesson 9).
+
+# %%
+T = chain.transition_matrix()                        # T[s, s'] under the random policy (terminal rows are zero)
+gamma = 1.0
+V_true = np.linalg.solve(np.eye(chain.n_states) - gamma * T, T @ chain.R)   # (I - γT) V = T R
+for name, v in zip(chain.names, V_true):
+    print(f"V({name}) = {v:.3f}")
+
+# %% [markdown]
+The five chain states have values $1/6, 2/6, \dots, 5/6$ — we will use these as the ground truth to judge the learning algorithms.
+
+### ✏️ Exercise 4.2 — One Bellman step by hand *(maths)*
+
+In the three-state chain under a random policy with $\gamma = 1$, suppose you already know that $V(B) = 0.5$. Apply the Bellman equation once to compute $V(C)$, the value of the state next to the rewarded exit (remember that the exit itself is terminal, with value 0).
+
+# %% [exercise 4.2]
+answer = None   # <- your number
+check("4.2", answer)
+
+# %% [markdown]
+## 4.3 TD(0): learning values from experience
+
+Solving the Bellman equation needs the transition probabilities, which a learner usually does not have. It only has experience: a sequence of states and rewards. Two ideas for learning from it:
+
+- **Monte Carlo**: wait until the episode ends, compute the return that was actually obtained, and move the value of each visited state towards it. Unbiased, but nothing is learned until the end, and some tasks never end.
+- **Temporal-difference learning** (Sutton, 1988): use the Bellman equation as the target. After every transition $s \to s'$ with reward $r$,
+
+$$
+\delta = r + \gamma V(s') - V(s), \qquad V(s) \leftarrow V(s) + \alpha\, \delta .
+$$
+
+This is exactly the Rescorla–Wagner rule with the reward replaced by $r + \gamma V(s')$. The agent uses its own current estimate of the next state's value as part of the target — it **bootstraps**. Lesson 3's rule is the special case of a one-step episode, where nothing follows the outcome and $V(s') = 0$. The quantity $\delta$ is the **TD error** (or reward prediction error): the difference between the new, better-informed estimate $r + \gamma V(s')$ and the old one.
+
+### ✏️ Exercise 4.3 — The TD(0) update *(coding)*
+
+Implement one TD(0) update. `V` is the array of state values, `s` the state the agent was in, `r` the reward received, `s_next` the state it moved to, and `done` is `True` if `s_next` is terminal (nothing follows, so the target is just `r`). Return a **new** array (`np.array(V, dtype=float)` makes a copy) rather than modifying `V` in place.
+
+# %% [exercise 4.3]
+def td0_update(V, s, r, s_next, alpha, gamma=1.0, done=False):
+    """TD(0) prediction update for state values.  Returns a *new* array."""
+    V = np.array(V, dtype=float)
+    target = ...                    # <- r + gamma * V[s_next], or just r if the episode ended
+    delta = ...                     # <- the TD error
+    V[s] = ...                      # <- move V[s] a fraction alpha towards the target
+    return V
+
+check("4.3", td0_update)
+
+# %% [markdown]
+Let's reproduce Sutton & Barto's Example 6.2 with your update: a random walk on the five-state chain, all values initialised to 0.5, $\alpha = 0.1$. The loop below is the template for every TD simulation: reset, then repeat *act → observe transition → update* until the episode ends.
+
+# %%
+td0_update = use("4.3", td0_update)      # your function if it passes the check, else the reference
+
+def run_td0(mdp, n_episodes, alpha, gamma, rng, V0=0.5):
+    """TD(0) prediction under a random policy; returns the values after every episode."""
+    V = np.full(mdp.n_states, V0)
+    V[mdp.terminal] = 0.0                                   # terminal states have no future
+    history = [V.copy()]
+    for _ in range(n_episodes):
+        s, done = mdp.reset(rng), False
+        while not done:
+            s_next, r, done = mdp.step(rng.integers(mdp.n_actions), rng)
+            V = td0_update(V, s, r, s_next, alpha, gamma, done)
+            s = s_next
+        history.append(V.copy())
+    return np.array(history)
+
+history = run_td0(chain, n_episodes=100, alpha=0.1, gamma=1.0, rng=rng)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+for n in [0, 1, 10, 100]:
+    axes[0].plot(chain.names[1:-1], history[n, 1:-1], "o-", label=f"after {n} episodes")
+axes[0].plot(chain.names[1:-1], V_true[1:-1], "k--", lw=1.2, label="true values")
+axes[0].set(title="TD(0) on the random walk (α = 0.1)", xlabel="state", ylabel="estimated value V")
+axes[0].legend(fontsize=8)
+
+for alpha in [0.05, 0.1, 0.15]:
+    rms = np.mean([np.sqrt(np.mean((run_td0(chain, 100, alpha, 1.0, rng)[:, 1:-1] - V_true[1:-1])**2, axis=1))
+                   for _ in range(50)], axis=0)
+    axes[1].plot(rms, label=f"α = {alpha}")
+axes[1].set(title="Error of the estimates (average of 50 runs)", xlabel="episode", ylabel="RMS error over the five states")
+axes[1].legend()
+plt.show()
+
+# %% [markdown]
+After one episode only the states next to the exit that was used have moved; after ten the shape is right; after a hundred the estimates sit close to the true line. As in lesson 3, a larger $\alpha$ learns faster at first but settles at a noisier estimate (right panel): the same stability–flexibility trade-off, now in a sequential task.
+
+## 4.4 Dopamine and the TD error
+
+In the 1990s Wolfram Schultz and colleagues recorded dopamine neurons in the midbrain of monkeys learning that a cue (a light or sound) predicted a drop of juice. Three observations were hard to explain with the idea that dopamine simply signals *reward*:
+
+1. **Before learning**, the neurons fired when the juice arrived.
+2. **After learning**, they fired at the *cue* and no longer at the juice.
+3. If a predicted juice was **omitted**, their firing *dipped below baseline* at the time the juice should have arrived.
+
+Montague, Dayan & Sejnowski (1996) and Schultz, Dayan & Montague (1997) showed that all three are what the TD error $\delta$ does. To see it, treat each time step after the cue as a state (a *complete serial compound*, or tapped delay line: "cue appeared 1 step ago", "2 steps ago", …), so that a conditioning trial is a chain of states, just like the random walk. TD learning then runs exactly as in section 4.3, with one convention to fix: what is predicted *before* the cue? Nothing — no stimulus, no state, no prediction.
+
+With time steps $t = 0, 1, \dots, n-1$ counted from cue onset, the course's convention is that the TD error is computed on *arriving* at step $t$:
+
+$$
+\delta_t = r_t + \gamma\, V[t] - V[t-1], \qquad V[-1] \equiv 0 \ \text{(nothing predicts the cue)},
+$$
+
+and this error trains the prediction that was just made, $V[t-1] \leftarrow V[t-1] + \alpha\, \delta_t$ (for $t \ge 1$). After the last step the trial ends and nothing follows, so one more error $\delta_{\text{end}} = 0 - V[n-1]$ trains $V[n-1]$. Notice what this gives at the cue: $\delta_0 = \gamma V[0] - 0$, the value the cue carries minus the nothing that preceded it.
+
+### ✏️ Exercise 4.4 — TD learning across a conditioning trial *(coding)*
+
+Implement TD(0) across a series of conditioning trials. `reward_sequences` is a list with one array per trial, giving the reward at every time step from the cue onwards (`tasks.PavlovianTrace(...).rewards()` builds such arrays). Return `(V_history, delta_history)`: the values *before* each trial, shape `(n_trials + 1, n_steps)` (the first row is the initial zeros), and the errors on each trial, shape `(n_trials, n_steps + 1)` (the last column is the error at trial end).
+
+# %% [exercise 4.4]
+def td_pavlovian(reward_sequences, alpha, gamma=1.0):
+    """TD(0) learning of time-step values across conditioning trials.
+
+    Convention: delta_t = r_t + gamma * V[t] - V[t-1] with V[-1] = 0 (nothing before the cue);
+    the error trains V[t-1]; after the last step delta_end = 0 - V[n-1] trains V[n-1].
+    Returns (V_history, delta_history).
+    """
+    n_steps = len(reward_sequences[0])
+    V = np.zeros(n_steps)
+    V_history, delta_history = [V.copy()], []
+    for rewards in reward_sequences:
+        deltas = np.zeros(n_steps + 1)
+        raise NotImplementedError("your code here: loop over the time steps, then the end-of-trial step")
+        V_history.append(V.copy())
+        delta_history.append(deltas)
+    return np.array(V_history), np.array(delta_history)
+
+check("4.4", td_pavlovian)
+
+# %% [markdown]
+Now the experiment: a cue at time step 0, juice at step 10, 400 training trials, then one trial on which the juice is withheld.
+
+# %%
+td_pavlovian = use("4.4", td_pavlovian)
+
+trace = tasks.PavlovianTrace(n_steps=15, t_us=10)                      # cue at t = 0, reward at t = 10
+trials = [trace.rewards() for _ in range(400)] + [trace.rewards(omit=True)]
+V_history, delta_history = td_pavlovian(trials, alpha=0.2, gamma=0.98)
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), sharey=True)
+panels = [(0, "before learning (trial 1)"), (399, "after learning (trial 400)"), (400, "reward omitted (trial 401)")]
+for ax, (trial, title) in zip(axes, panels):
+    ax.bar(np.arange(trace.n_steps + 1), delta_history[trial], color=plotting.PALETTE[0], width=0.8)
+    ax.axvline(0, color="#52514e", ls=":", lw=1); ax.axvline(trace.t_us, color="#52514e", ls=":", lw=1)
+    ax.text(0.3, 0.9, "cue", color="#52514e", fontsize=9); ax.text(trace.t_us + 0.3, 0.9, "reward time", color="#52514e", fontsize=9)
+    ax.axhline(0, color="#52514e", lw=0.8)
+    ax.set(title=title, xlabel="time step since the cue")
+axes[0].set_ylabel("TD error δ  (dopamine response)")
+plt.suptitle("The TD model reproduces the three classic dopamine findings (Schultz, Dayan & Montague, 1997)", y=1.04)
+plt.show()
+
+# %% [markdown]
+Panel by panel: before learning, the only surprise is the juice ($\delta = 1$ at step 10). After learning, the juice is fully predicted ($\delta \approx 0$ there) and the surprise has moved to the cue ($\delta_0 = \gamma V[0] \approx \gamma^{10}$, slightly less than 1 because of discounting). When the juice is omitted, the prediction at step 9 is not met: $\delta = 0 - V[9] \approx -1$, a dip below baseline. The image below shows *how* the surprise travels: value propagates backwards one step per trial, from the reward to the cue.
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 3.6))
+im = ax.imshow(V_history[:400:4].T, aspect="auto", origin="lower", cmap=plotting.SEQUENTIAL,
+               extent=[0, 400, -0.5, trace.n_steps - 0.5])
+ax.set(xlabel="training trial", ylabel="time step since the cue", title="Values propagate backwards from the reward to the cue")
+plt.colorbar(im, ax=ax, label="V[t]")
+plt.show()
+
+# %% [markdown]
+### ✏️ Exercise 4.5 — What the cue response means *(conceptual)*
+
+After learning, the TD error (and the dopamine burst) at the cue represents ...
+
+**(a)** the reward itself, delivered earlier than before
+**(b)** the discounted reward that the cue now predicts and that was not predicted before the cue appeared
+**(c)** the motor command to approach the reward
+**(d)** the agent's uncertainty about whether the reward will come
+
+# %% [exercise 4.5]
+check("4.5", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 4.5 Learning to act: SARSA and Q-learning
+
+Prediction is only half the problem; the agent also has to *choose*. The natural object is the **action value** $Q(s, a)$: the expected return after taking action $a$ in state $s$. Given action values, choosing is easy — softmax or $\varepsilon$-greedy over $Q(s, \cdot)$, exactly as in lesson 3 — and the TD idea gives two ways to learn them. They differ only in which next-state value appears in the target.
+
+**SARSA** (Rummery & Niranjan, 1994; named after the quintuple $S, A, R, S', A'$ it uses) bootstraps from the action the agent *actually takes next*:
+
+$$
+Q(s, a) \leftarrow Q(s, a) + \alpha \big[\, r + \gamma\, Q(s', a') - Q(s, a) \,\big].
+$$
+
+**Q-learning** (Watkins, 1989; Watkins & Dayan, 1992) bootstraps from the *best* action available next, whatever the agent then does:
+
+$$
+Q(s, a) \leftarrow Q(s, a) + \alpha \big[\, r + \gamma \max_{a'} Q(s', a') - Q(s, a) \,\big].
+$$
+
+SARSA therefore learns the values of the policy it is following, exploration included — it is **on-policy**. Q-learning learns the values of the greedy policy while behaving however it likes — it is **off-policy**. The difference sounds technical but has behavioural consequences, as the cliff below will show.
+
+### ✏️ Exercise 4.6 — The Q-learning update *(coding)*
+
+`Q` is a 2-D array `Q[state, action]`. Implement one Q-learning update and return a new array. If `done` is `True` the target is just `r`.
+
+# %% [exercise 4.6]
+def q_learning_update(Q, s, a, r, s_next, alpha, gamma=1.0, done=False):
+    """Q-learning (off-policy TD control) update.  Returns a *new* array."""
+    Q = np.array(Q, dtype=float)
+    target = ...                    # <- r + gamma * (best action value in s_next), or r if done
+    Q[s, a] = ...                   # <- the delta rule on the (s, a) pair
+    return Q
+
+check("4.6", q_learning_update)
+
+# %% [markdown]
+### ✏️ Exercise 4.7 — The SARSA update *(coding)*
+
+Same as above, but the target uses the action `a_next` that the agent actually takes in `s_next`.
+
+# %% [exercise 4.7]
+def sarsa_update(Q, s, a, r, s_next, a_next, alpha, gamma=1.0, done=False):
+    """SARSA (on-policy TD control) update.  Returns a *new* array."""
+    Q = np.array(Q, dtype=float)
+    target = ...                    # <- r + gamma * Q[s_next, a_next], or r if done
+    Q[s, a] = ...
+    return Q
+
+check("4.7", sarsa_update)
+
+# %% [markdown]
+### The cliff
+
+Sutton & Barto's cliff-walking task (their Example 6.6) is the classic demonstration. Our miniature version is a 4 × 5 grid: the agent starts bottom-left and must reach the goal bottom-right (worth +10). Every step costs 1, and the three cells between start and goal are a cliff: stepping onto one costs 20 (the agent then climbs out and continues). The shortest path runs right along the edge of the cliff. Both agents explore with $\varepsilon$-greedy choices ($\varepsilon = 0.2$), so an exploratory "down" from the edge means a fall.
+
+# %%
+q_learning_update = use("4.6", q_learning_update)
+sarsa_update = use("4.7", sarsa_update)
+
+cliff_world = tasks.gridworld(n_rows=4, n_cols=5, goal=(3, 4), start=(3, 0))
+cell = lambda row, col: row * 5 + col
+cliff = [cell(3, 1), cell(3, 2), cell(3, 3)]
+cliff_world.R[:] = -1.0                  # every step costs 1 ...
+cliff_world.R[cliff] = -20.0             # ... stepping onto the cliff costs 20 ...
+cliff_world.R[cell(3, 4)] = 10.0         # ... reaching the goal pays 10
+
+def run_control(mdp, algorithm, n_episodes, alpha, gamma, epsilon, rng):
+    """epsilon-greedy SARSA or Q-learning; returns Q and the return of every episode."""
+    Q = np.zeros((mdp.n_states, mdp.n_actions))
+    returns = np.zeros(n_episodes)
+    for ep in range(n_episodes):
+        s = mdp.reset(rng)
+        a = models.choose(models.epsilon_greedy_probs(Q[s], epsilon), rng)
+        done, total, steps = False, 0.0, 0
+        while not done and steps < 300:
+            s_next, r, done = mdp.step(a, rng)
+            a_next = models.choose(models.epsilon_greedy_probs(Q[s_next], epsilon), rng)   # the action actually taken next
+            if algorithm == "sarsa":
+                Q = sarsa_update(Q, s, a, r, s_next, a_next, alpha, gamma, done)
+            else:
+                Q = q_learning_update(Q, s, a, r, s_next, alpha, gamma, done)
+            s, a, total, steps = s_next, a_next, total + r, steps + 1
+        returns[ep] = total
+    return Q, returns
+
+results = {alg: run_control(cliff_world, alg, n_episodes=600, alpha=0.3, gamma=0.95, epsilon=0.2, rng=rng)
+           for alg in ["sarsa", "q_learning"]}
+
+def plot_policy(mdp, Q, ax, title):
+    n_rows, n_cols = mdp.shape
+    ax.imshow(np.max(Q, axis=1).reshape(n_rows, n_cols), cmap=plotting.SEQUENTIAL)
+    for s in range(mdp.n_states):
+        row, col = divmod(s, n_cols)
+        label = "G" if mdp.terminal[s] else ("✗" if s in cliff else "↑→↓←"[int(np.argmax(Q[s]))])
+        ax.text(col, row, label, ha="center", va="center", fontsize=15, color="#0b0b0b")
+    ax.text(-0.42, 2.62, "start", fontsize=7, color="#0b0b0b")
+    ax.set(title=title, xticks=[], yticks=[]); ax.grid(False)
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 3.6), width_ratios=[1.7, 1, 1])
+smooth = lambda x: np.convolve(x, np.ones(25) / 25, mode="valid")
+axes[0].plot(smooth(results["sarsa"][1]), label="SARSA (on-policy)")
+axes[0].plot(smooth(results["q_learning"][1]), label="Q-learning (off-policy)")
+axes[0].set(title="Return per episode while learning (smoothed)", xlabel="episode", ylabel="return")
+axes[0].legend()
+plot_policy(cliff_world, results["sarsa"][0], axes[1], "SARSA: greedy policy")
+plot_policy(cliff_world, results["q_learning"][0], axes[2], "Q-learning: greedy policy")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+Q-learning finds the optimal path along the edge, but *while learning* it keeps falling off during exploratory steps, so its return per episode is worse. SARSA's values include the cost of its own exploration, so it learns the safer route one row up: a slightly longer path that is better *for an agent that explores*. Which is "right" depends on whether you ask about the values of the optimal policy or of the policy actually being executed — a distinction that matters when interpreting fitted models of behaviour.
+
+### ✏️ Exercise 4.8 — On-policy or off-policy? *(conceptual)*
+
+Which algorithm learns the value of the policy it actually follows, including the consequences of its own exploratory actions?
+
+**(a)** Q-learning  **(b)** SARSA  **(c)** both  **(d)** neither
+
+# %% [exercise 4.8]
+check("4.8", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 4.6 Eligibility traces: TD($\lambda$)
+
+TD(0) moves value back by one step per visit — in the conditioning simulation it took hundreds of trials to carry the reward's value ten steps back to the cue. **Eligibility traces** speed this up. Each state keeps a trace $e(s)$ of how recently (and how often) it was visited: it is incremented when the state is visited and otherwise decays by $\gamma\lambda$ per step. Every TD error is then credited to *all* states in proportion to their traces:
+
+$$
+e(s_t) \leftarrow e(s_t) + 1, \qquad V(s) \leftarrow V(s) + \alpha\, \delta_t\, e(s)\ \ \text{for every } s, \qquad e(s) \leftarrow \gamma \lambda\, e(s).
+$$
+
+With $\lambda = 0$ only the current state has a non-zero trace and we are back to TD(0); with $\lambda = 1$ (in an episodic task) every state receives the full subsequent error, which amounts to a Monte Carlo update. Intermediate $\lambda$ interpolates. This is also exactly the $\lambda$ in Daw et al.'s (2011) model of the two-step task (lesson 9), where it governs how much the outcome of the second stage teaches the first-stage choice.
+
+### ✏️ Exercise 4.9 — TD($\lambda$) with eligibility traces *(coding)*
+
+Implement TD($\lambda$) with **accumulating** traces over one episode. `states` is the list $[s_0, s_1, \dots, s_T]$ (the last state is terminal) and `rewards` the list $[r_1, \dots, r_T]$ received on each transition. For each step: compute the TD error (the last transition is terminal, so its target is just the reward), add 1 to the trace of the current state, update the whole value vector, then decay the traces.
+
+# %% [exercise 4.9]
+def td_lambda_episode(V, states, rewards, alpha, gamma=1.0, lam=0.0):
+    """TD(lambda) with accumulating eligibility traces over one episode.  Returns the updated values."""
+    V = np.array(V, dtype=float)
+    e = np.zeros_like(V)                        # eligibility traces
+    for t in range(len(rewards)):
+        s, s_next, r = states[t], states[t + 1], rewards[t]
+        done = t == len(rewards) - 1            # the last transition enters the terminal state
+        delta = ...                             # <- TD error (no bootstrapping if done)
+        e[s] = ...                              # <- accumulate the trace of the current state
+        V = ...                                 # <- every state learns in proportion to its trace
+        e = ...                                 # <- traces decay
+    return V
+
+check("4.9", td_lambda_episode)
+
+# %% [markdown]
+To see what traces buy, we use a longer chain (nine states) where TD(0) needs many episodes to carry value from the exit to the far states.
+
+# %%
+td_lambda_episode = use("4.9", td_lambda_episode)
+
+long_chain = tasks.random_walk_chain(n_states=9)
+T_long = long_chain.transition_matrix()
+V_true_long = np.linalg.solve(np.eye(long_chain.n_states) - T_long, T_long @ long_chain.R)
+
+def run_td_lambda(mdp, n_episodes, alpha, gamma, lam, rng, V0=0.5):
+    """Collect each episode, then apply TD(lambda); returns the RMS error after every episode."""
+    V = np.full(mdp.n_states, V0); V[mdp.terminal] = 0.0
+    errors = []
+    for _ in range(n_episodes):
+        s, states, rewards, done = mdp.reset(rng), [], [], False
+        states.append(s)
+        while not done:
+            s, r, done = mdp.step(rng.integers(mdp.n_actions), rng)
+            states.append(s); rewards.append(r)
+        V = td_lambda_episode(V, states, rewards, alpha, gamma, lam)
+        errors.append(np.sqrt(np.mean((V[1:-1] - V_true_long[1:-1])**2)))
+    return np.array(errors)
+
+fig, ax = plt.subplots(figsize=(7, 3.8))
+for lam in [0.0, 0.5, 0.9]:
+    curves = [run_td_lambda(long_chain, 60, alpha=0.1, gamma=1.0, lam=lam, rng=rng) for _ in range(30)]
+    ax.plot(np.mean(curves, axis=0), label=f"λ = {lam}" + ("  (TD(0))" if lam == 0 else ""))
+ax.set(title="Eligibility traces speed up learning on a 9-state chain (α = 0.1, 30 runs)", xlabel="episode",
+       ylabel="RMS error of the values")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+Traces make the early episodes far more efficient — each reward teaches every state visited on the way. Very large $\lambda$ also makes the updates noisier (the Monte Carlo end of the spectrum), so the best $\lambda$ is usually intermediate.
+
+### ✏️ Exercise 4.10 — How fast a trace fades *(maths)*
+
+With accumulating traces, $\gamma = 0.9$ and $\lambda = 0.5$, a state is visited once and not again. What is its eligibility trace two steps later?
+
+# %% [exercise 4.10]
+answer = None   # <- your number
+check("4.10", answer)
+
+# %% [markdown]
+## 4.7 The actor–critic
+
+SARSA and Q-learning derive actions from action values. An older and biologically influential alternative keeps *two* learners (Barto, Sutton & Anderson, 1983): a **critic** that learns state values $V(s)$ by TD, and an **actor** that holds a policy — here a set of action preferences $\theta(s, a)$ turned into probabilities by a softmax — and improves it using the critic's TD error:
+
+$$
+\delta_t = r + \gamma V(s') - V(s), \qquad
+V(s) \leftarrow V(s) + \alpha_{\text{critic}}\, \delta_t, \qquad
+\theta(s, \cdot) \leftarrow \theta(s, \cdot) + \alpha_{\text{actor}}\, \delta_t \big[\, \mathbf{1}_a - \pi(\cdot \mid s) \,\big].
+$$
+
+The actor's rule is the gradient of $\log \pi(a \mid s)$ for a softmax policy: the chosen action's preference rises by $\delta$ (times one minus its probability) and the others fall in proportion to their probability. A positive surprise makes the action more likely, a negative one less. Joel, Niv & Ruppin (2002) reviewed how naturally this maps onto the basal ganglia: the critic onto the ventral striatum, the actor onto the dorsal striatum, and $\delta$ onto the dopamine signal that trains both.
+
+# %%
+from rlcourse.models import softmax, choose     # the softmax of lesson 3 (the actor needs it)
+print("softmax of the preferences [0, 0.5]:", np.round(softmax([0.0, 0.5]), 3))
+
+# %% [markdown]
+### ✏️ Exercise 4.11 — One actor–critic step *(coding)*
+
+Implement one actor–critic update and return `(V, theta, delta)` as new arrays. Compute $\delta$ once, from the values *before* the update, and use that same $\delta$ for both the critic and the actor.
+
+# %% [exercise 4.11]
+def actor_critic_update(V, theta, s, a, r, s_next, alpha_critic, alpha_actor, gamma=1.0, done=False):
+    """One actor-critic step with a softmax actor (theta = action preferences).  Returns (V, theta, delta)."""
+    V = np.array(V, dtype=float)
+    theta = np.array(theta, dtype=float)
+    target = ...                             # <- r + gamma * V[s_next], or r if done
+    delta = ...                              # <- the critic's TD error
+    V[s] = ...                               # <- critic update
+    probs = softmax(theta[s])
+    grad = ...                               # <- one_hot(a) - probs : the gradient of log pi(a | s)
+    theta[s] = ...                           # <- actor update
+    return V, theta, delta
+
+check("4.11", actor_critic_update)
+
+# %% [markdown]
+On the five-state chain the actor should learn to walk right. We track the probability of choosing "right" in every state as learning proceeds.
+
+# %%
+actor_critic_update = use("4.11", actor_critic_update)
+
+def run_actor_critic(mdp, n_episodes, alpha_critic, alpha_actor, gamma, rng):
+    V = np.zeros(mdp.n_states)
+    theta = np.zeros((mdp.n_states, mdp.n_actions))
+    p_right = np.zeros((n_episodes, mdp.n_states))
+    for ep in range(n_episodes):
+        s, done, steps = mdp.reset(rng), False, 0
+        while not done and steps < 500:
+            a = choose(softmax(theta[s]), rng)                       # the actor chooses
+            s_next, r, done = mdp.step(a, rng)
+            V, theta, delta = actor_critic_update(V, theta, s, a, r, s_next, alpha_critic, alpha_actor, gamma, done)
+            s, steps = s_next, steps + 1
+        p_right[ep] = [softmax(theta[st])[1] for st in range(mdp.n_states)]
+    return V, theta, p_right
+
+V_ac, theta_ac, p_right = run_actor_critic(chain, n_episodes=300, alpha_critic=0.1, alpha_actor=0.5, gamma=0.95, rng=rng)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+for s_idx in range(1, chain.n_states - 1):
+    axes[0].plot(p_right[:, s_idx], label=f"state {chain.names[s_idx]}")
+axes[0].set(title="The actor learns to go right", xlabel="episode", ylabel="P(choose right)", ylim=(0.4, 1.02))
+axes[0].legend(fontsize=8)
+axes[1].bar(chain.names[1:-1], V_ac[1:-1], color=plotting.PALETTE[1])
+axes[1].set(title="The critic's values after learning", xlabel="state", ylabel="V")
+plt.show()
+
+# %% [markdown]
+States near the rewarded exit are visited most and learn first; the far states learn more slowly because the agent rarely gets there once it has learned to head right — the policy shapes the experience that trains it, a feature of on-policy learners that lessons 9 and 14 will return to.
+
+### ✏️ Exercise 4.12 — How TD solves temporal credit assignment *(conceptual, written)*
+
+In 2–4 sentences: a reward arrives ten steps after the cue that predicted it. How does TD learning manage to assign value to the cue, and why is the learned signal strongest at the cue rather than at the reward?
+
+# %% [exercise 4.12]
+check("4.12", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A sequential task is an **MDP**; the agent maximises the discounted **return**, and the **Bellman equation** relates each state's value to one step of experience plus the value of the next state.
+- **TD(0)** learns values by *bootstrapping*: the target is $r + \gamma V(s')$, so the Rescorla–Wagner rule generalises to delayed outcomes; the **TD error** $\delta$ is the surprise at each step.
+- The TD error reproduces the three hallmark **dopamine** findings: response to unpredicted reward, transfer to the predictive cue, and a dip when a predicted reward is omitted.
+- **SARSA** (on-policy) and **Q-learning** (off-policy) learn action values; they differ only in whether the target uses the action actually taken next or the best one — and this shows in behaviour (the cliff).
+- **Eligibility traces** credit every recently visited state and speed learning; the **actor–critic** splits prediction (critic, ventral striatum) from action selection (actor, dorsal striatum), both trained by $\delta$.
+
+## What's next
+
+Lesson 5 turns the direction of inference around: given a participant's choices, which parameters most likely produced them? The functions you wrote here are the *generative* side; lesson 5 shows how to replay them on data to compute a likelihood.
+
+## References
+
+- Sutton, R. S. (1988). Learning to predict by the methods of temporal differences. *Machine Learning, 3*, 9–44. https://doi.org/10.1007/BF00115009
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.), chapters 3, 6, 12 and 13. MIT Press. http://incompleteideas.net/book/the-book-2nd.html
+- Watkins, C. J. C. H. (1989). *Learning from delayed rewards* (PhD thesis). University of Cambridge.
+- Watkins, C. J. C. H., & Dayan, P. (1992). Q-learning. *Machine Learning, 8*, 279–292. https://doi.org/10.1007/BF00992698
+- Rummery, G. A., & Niranjan, M. (1994). *On-line Q-learning using connectionist systems* (Technical Report CUED/F-INFENG/TR 166). Cambridge University Engineering Department.
+- Barto, A. G., Sutton, R. S., & Anderson, C. W. (1983). Neuronlike adaptive elements that can solve difficult learning control problems. *IEEE Transactions on Systems, Man, and Cybernetics, SMC-13*(5), 834–846. https://doi.org/10.1109/TSMC.1983.6313077
+- Montague, P. R., Dayan, P., & Sejnowski, T. J. (1996). A framework for mesencephalic dopamine systems based on predictive Hebbian learning. *Journal of Neuroscience, 16*(5), 1936–1947. https://doi.org/10.1523/JNEUROSCI.16-05-01936.1996
+- Schultz, W., Dayan, P., & Montague, P. R. (1997). A neural substrate of prediction and reward. *Science, 275*(5306), 1593–1599. https://doi.org/10.1126/science.275.5306.1593
+- Joel, D., Niv, Y., & Ruppin, E. (2002). Actor–critic models of the basal ganglia: New anatomical and computational perspectives. *Neural Networks, 15*(4–6), 535–547. https://doi.org/10.1016/S0893-6080(02)00047-3
+- Niv, Y. (2009). Reinforcement learning in the brain. *Journal of Mathematical Psychology, 53*(3), 139–154. https://doi.org/10.1016/j.jmp.2008.12.005
+- Daw, N. D., Gershman, S. J., Seymour, B., Dayan, P., & Dolan, R. J. (2011). Model-based influences on humans' choices and striatal prediction errors. *Neuron, 69*(6), 1204–1215. https://doi.org/10.1016/j.neuron.2011.02.027

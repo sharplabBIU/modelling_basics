@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlcourse"
+version = "1.0.0"
+description = "Reinforcement learning for computational cognitive science: a tutorial course with auto-checked exercises"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Sharp Lab, Bar-Ilan University" }]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "matplotlib>=3.6",
+    "pandas>=1.5",
+    "jupyterlab>=3.5",
+    "ipykernel>=6",
+    "nbformat>=5.7",
+    "nbclient>=0.7",
+]
+
+[project.optional-dependencies]
+bayes = ["pymc>=5.10", "arviz>=0.15", "numpyro>=0.13", "jax>=0.4", "statsmodels>=0.14"]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["rlcourse", "rlcourse.exercises"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

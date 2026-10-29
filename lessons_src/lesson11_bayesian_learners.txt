@@ -1,0 +1,453 @@
+# %% [markdown]
+# Lesson 11 — Bayesian learners I: uncertainty-aware learning and exploration
+
+The Rescorla–Wagner learner of lesson 3 moves its estimate a fixed fraction $\alpha$ of the way towards every outcome. That constant was a design choice, not a law. A learner that keeps track of *how sure it is* can do better: it should learn fast when it knows little, slow down as evidence accumulates, speed up again when the world changes, and — when it has to choose — be drawn towards options it is uncertain about. This lesson develops that idea step by step, from a Bayesian coin-flipper to the Kalman filter, uncertainty-guided exploration, change-point detection, and the Pearce–Hall rule that approximates all of this with a single heuristic.
+
+**What you will learn**
+
+- why the learning rate of a Bayesian learner is its *relative uncertainty*, and why it shrinks in a stable world,
+- the Beta–Bernoulli learner and its forgetful variant,
+- the Kalman filter as a Rescorla–Wagner rule with a self-adjusting learning rate,
+- how uncertainty drives exploration: upper confidence bounds, Thompson sampling, and the human evidence for directed and random exploration,
+- exact Bayesian tracking of a probability that occasionally jumps (change-points), and why its effective learning rate spikes after surprises,
+- the Pearce–Hall rule as a cheap approximation to all of the above.
+
+**Prerequisites:** lessons 2 (Bayes' rule, the Beta distribution) and 3 (Rescorla–Wagner, softmax, bandits).
+
+**Estimated time:** 2.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 11.1 When is a constant learning rate the right thing to do?
+
+Lesson 3 showed that Rescorla–Wagner (RW) computes an exponentially weighted average of past outcomes, and lesson 2 that the *optimal* estimate of a fixed probability is the plain average — a learner whose learning rate falls as $1/n$. Here are the two side by side on an option that pays with probability 0.7 for 100 trials and then switches to 0.3:
+
+# %%
+n_trials = 200
+true_p = np.where(np.arange(n_trials) < 100, 0.7, 0.3)
+outcomes = (rng.random(n_trials) < true_p).astype(float)
+
+v_rw, a, b = 0.5, 1.0, 1.0                     # RW value; Beta(1, 1) prior counts
+hist_rw, hist_bayes = [], []
+for o in outcomes:
+    hist_rw.append(v_rw); hist_bayes.append(a / (a + b))
+    v_rw = models.rw_update(v_rw, o, alpha=0.1)
+    a, b = models.beta_update(a, b, o)          # Bayesian counting (lesson 2)
+
+fig, ax = plt.subplots(figsize=(8, 3.8))
+ax.plot(hist_rw, label="Rescorla–Wagner, α = 0.1")
+ax.plot(hist_bayes, label="Bayesian average (Beta–Bernoulli)")
+ax.plot(true_p, color="#52514e", ls="--", lw=1, label="true probability")
+ax.set(xlabel="trial", ylabel="estimate of P(reward)", title="A fixed learning rate versus a shrinking one")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+Before the change the Bayesian average is clearly better: it converges smoothly while RW keeps wobbling with every outcome. After the change it is clearly worse: its learning rate has shrunk to $1/100$, so it needs another hundred trials to notice that anything happened. Neither learner is right in general, because the right learning rate depends on **two uncertainties**:
+
+- how uncertain the learner is about its *own estimate* — large at the start, small after many outcomes, large again after a change;
+- how noisy the *outcomes* are — a single outcome from a 70% option says little.
+
+The Bayesian principle that runs through this lesson is that the learning rate should be the share of the total uncertainty that belongs to the estimate:
+
+$$
+\text{learning rate} \;\approx\; \frac{\text{uncertainty of the estimate}}{\text{uncertainty of the estimate} + \text{noise of the outcome}} .
+$$
+
+A learner that tracks its uncertainty gets the learning rate for free. Let's build such learners, starting with the simplest.
+
+## 11.2 The Beta–Bernoulli learner
+
+For a reward probability $p$ the natural belief is a Beta distribution, $p \sim \mathrm{Beta}(a, b)$, whose two parameters are pseudo-counts of successes and failures (lesson 2). Observing a reward $r \in \{0, 1\}$ updates the counts:
+
+$$
+a \leftarrow a + r, \qquad b \leftarrow b + (1 - r).
+$$
+
+### ✏️ Exercise 11.1 — The Beta–Bernoulli update *(coding)*
+
+Return the updated pair `(a, b)` after one outcome `reward` (1 or 0).
+
+# %% [exercise 11.1]
+def beta_update(a, b, reward):
+    """Bayesian update of a Beta(a, b) belief about a reward probability after one Bernoulli outcome."""
+    return ...          # <- the new (a, b): a reward adds a success, a non-reward adds a failure
+
+check("11.1", beta_update)
+
+# %% [markdown]
+Counting does not look like Rescorla–Wagner, but it is one in disguise. The posterior mean $m = a/(a+b)$ moves, after one outcome, by
+
+$$
+m' - m = \frac{a + r}{a + b + 1} - \frac{a}{a + b} = \frac{r - m}{a + b + 1},
+$$
+
+a delta rule whose learning rate $1/(a + b + 1)$ *shrinks* as the counts grow. The learner is most responsive when it knows least.
+
+### ✏️ Exercise 11.2 — The learning rate of a Bayesian learner *(maths)*
+
+A learner starts from a $\mathrm{Beta}(1, 1)$ prior and has already seen 8 outcomes. With what learning rate (the factor multiplying the prediction error $r - m$) will it update its mean on the **9th** outcome? Give four decimals.
+
+# %% [exercise 11.2]
+answer = None   # <- your number
+check("11.2", answer)
+
+# %% [markdown]
+### Forgetting
+
+To cope with change, the Beta learner can *discount* old evidence before adding new: $a \leftarrow d\,a + r$, $b \leftarrow d\,b + (1 - r)$ with a decay $d < 1$ (`models.beta_update_forgetful`). The total count then saturates at $1/(1-d)$, so the learning rate stops shrinking and settles at $(1-d)/(2-d)$: forgetting turns the Bayesian learner back into something like RW, with a learning rate tied to how quickly it is willing to forget.
+
+# %%
+beta_update = use("11.1", beta_update)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+for decay in [1.0, 0.95, 0.85]:
+    a, b = 1.0, 1.0
+    rates, means = [], []
+    for o in outcomes:
+        rates.append(1 / (a + b + 1)); means.append(a / (a + b))
+        a, b = beta_update(a, b, o) if decay == 1.0 else models.beta_update_forgetful(a, b, o, decay)
+    label = "no forgetting" if decay == 1.0 else f"decay d = {decay}"
+    axes[0].plot(rates, label=label)
+    axes[1].plot(means, label=label)
+axes[0].axhline(0.1, color="#52514e", ls=":", lw=1, label="RW, α = 0.1")
+axes[0].set(xlabel="trial", ylabel="learning rate  1 / (a + b + 1)", title="The learning rate of Beta learners", yscale="log")
+axes[1].plot(true_p, color="#52514e", ls="--", lw=1, label="true probability")
+axes[1].set(xlabel="trial", ylabel="estimate of P(reward)", title="Tracking a change with forgetting")
+axes[0].legend(fontsize=8); axes[1].legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+## 11.3 Continuous rewards and the Kalman filter
+
+Many tasks pay out *amounts* (points, money) rather than hits and misses, and the amounts drift over time — the "restless bandit" of Daw et al. (2006). The Bayesian learner for this setting is the **Kalman filter** (Kalman 1960). Its belief about an option's mean payoff is a Gaussian $\mathcal{N}(\mu, v)$; the world is assumed to drift by Gaussian steps with variance $q$ (the *process variance*), and each observed reward is the true mean plus Gaussian noise with variance $\sigma^2$ (the *observation variance*). One trial has two steps:
+
+$$
+\text{predict:}\quad v^{-} = v + q \qquad\qquad
+\text{update:}\quad k = \frac{v^{-}}{v^{-} + \sigma^2}, \qquad \mu \leftarrow \mu + k\,(r - \mu), \qquad v \leftarrow (1 - k)\,v^{-} .
+$$
+
+The **Kalman gain** $k$ is a learning rate, and it is exactly the ratio from section 11.1: the learner's uncertainty $v^{-}$ divided by the total uncertainty $v^{-} + \sigma^2$. Gershman (2015) calls this learner the *Kalman Rescorla–Wagner* model: RW with a learning rate that is computed rather than assumed.
+
+### ✏️ Exercise 11.3 — One Kalman-filter update *(coding)*
+
+Implement one trial of the filter for a single option. Return the new mean, the new variance and the gain as a tuple `(mu_new, var_new, k)`.
+
+# %% [exercise 11.3]
+def kalman_update(mu, var, reward, obs_var, process_var=0.0):
+    """One Kalman-filter update of a Gaussian belief N(mu, var). Returns (mu_new, var_new, k)."""
+    var_prior = ...          # <- the belief diffuses before the outcome is seen
+    k = ...                  # <- the gain: share of the total uncertainty that is the learner's own
+    mu_new = ...             # <- a prediction-error update with learning rate k
+    var_new = ...            # <- the uncertainty shrinks by a factor (1 - k)
+    return mu_new, var_new, k
+
+check("11.3", kalman_update)
+
+# %% [markdown]
+### ✏️ Exercise 11.4 — The first Kalman gain *(maths)*
+
+A learner starts with a prior variance of 1, the observation variance is 1 and there is no process noise. What is the gain on the first update?
+
+# %% [exercise 11.4]
+answer = None   # <- your number
+check("11.4", answer)
+
+# %% [markdown]
+What happens to the gain over trials depends entirely on the process variance. Without process noise the uncertainty keeps shrinking and the gain follows the $1/n$ schedule of a running mean; with process noise the belief is "re-inflated" every trial and the gain settles at a steady value above zero — the learner never stops learning, because the world never stops moving.
+
+# %%
+kalman_update = use("11.3", kalman_update)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+for q in [0.0, 0.01, 0.1]:
+    mu, var = 0.0, 1.0
+    gains = []
+    for o in rng.normal(0, 1, 60):               # the rewards themselves do not affect the gain
+        mu, var, k = kalman_update(mu, var, o, obs_var=1.0, process_var=q)
+        gains.append(k)
+    axes[0].plot(gains, label=f"process variance q = {q}")
+axes[0].set(xlabel="trial", ylabel="Kalman gain k", title="The learning rate of a Kalman learner", yscale="log")
+axes[0].legend()
+
+# tracking a drifting mean: Kalman filter versus RW with a fixed learning rate
+n_t = 150
+true_mean = np.cumsum(rng.normal(0, 0.05, n_t)) + 1.0
+rewards = true_mean + rng.normal(0, 0.3, n_t)
+mu, var = 0.0, 1.0
+v_rw = 0.0
+kf_est, rw_est = [], []
+for r in rewards:
+    kf_est.append(mu); rw_est.append(v_rw)
+    mu, var, k = kalman_update(mu, var, r, obs_var=0.3 ** 2, process_var=0.05 ** 2)
+    v_rw = models.rw_update(v_rw, r, alpha=0.3)
+axes[1].plot(rewards, ".", color="#52514e", ms=3, alpha=0.5, label="rewards")
+axes[1].plot(true_mean, color="#52514e", ls="--", lw=1, label="true mean")
+axes[1].plot(kf_est, label="Kalman filter")
+axes[1].plot(rw_est, label="RW, α = 0.3")
+axes[1].set(xlabel="trial", ylabel="payoff", title="Tracking a drifting payoff")
+axes[1].legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+### ✏️ Exercise 11.5 — Where does the learning rate settle? *(maths)*
+
+With observation variance $\sigma^2 = 1$ and process variance $q = 0.1$, at what value does the Kalman gain settle in the long run? (Three decimals. Either solve the steady-state equations — at steady state the posterior variance $v$ satisfies $v = (1-k)(v+q)$ with $k = (v+q)/(v+q+\sigma^2)$ — or simply iterate `kalman_update` for a hundred trials and read off `k`.)
+
+# %% [exercise 11.5]
+answer = None   # <- your number
+check("11.5", answer)
+
+# %% [markdown]
+## 11.4 Exploration guided by uncertainty
+
+Uncertainty is useful for more than setting a learning rate: it can tell the agent **what to find out**. Daw et al. (2006) made this concrete with a four-armed restless bandit: a Kalman filter tracks every arm's mean *and* its uncertainty, and the uncertainty of an arm the agent has not pulled for a while keeps growing (`models.kalman_bandit_step` adds the process variance to every arm and updates only the chosen one). Three choice rules then differ in what they do with that uncertainty:
+
+- **Softmax on the means** (lesson 3): ignores uncertainty; explores only through decision noise.
+- **Upper confidence bound (UCB)** (Auer, Cesa-Bianchi & Fischer 2002): choose the arm with the largest $\mu + c\sqrt{v}$ — an *information bonus* for uncertain arms. This is **directed** exploration.
+- **Thompson sampling** (Thompson 1933): draw one sample from each arm's posterior and pick the largest. Uncertain arms produce wilder samples and are chosen more often — **random** exploration that scales with uncertainty.
+
+### ✏️ Exercise 11.6 — Upper-confidence-bound values *(coding)*
+
+Return the UCB value of every arm: its mean plus `c` times its standard deviation.
+
+# %% [exercise 11.6]
+def ucb_values(mu, var, c):
+    """Upper-confidence-bound values: mean + c * standard deviation."""
+    return ...          # <- optimism in the face of uncertainty
+
+check("11.6", ucb_values)
+
+# %% [markdown]
+Let's race the strategies on a restless bandit. Every arm's payoff drifts as a bounded random walk (we use `tasks.RestlessBandit` for the drifting means and add Gaussian reward noise); all agents use the same Kalman filter and differ only in the choice rule. We score each agent by the *expected* payoff of the arm it chose, averaged over 200 agents (the error bars are standard errors of that average).
+
+# %%
+ucb_values = use("11.6", ucb_values)
+
+def run_restless_bandit(policy, n_agents=200, n_trials=200, n_arms=4, obs_sd=0.3, drift_sd=0.05, beta=10.0, c=1.0):
+    """Expected payoff of the chosen arm on every trial, for every agent: array (n_agents, n_trials)."""
+    score = np.zeros((n_agents, n_trials))
+    for i in range(n_agents):
+        task = tasks.RestlessBandit(n_arms=n_arms, n_trials=n_trials, sd=drift_sd, bounds=(0.2, 0.8), rng=rng)
+        means = task.probs                                    # the drifting payoffs, shape (n_trials, n_arms)
+        mu, var = np.full(n_arms, 0.5), np.full(n_arms, 0.25)
+        for t in range(n_trials):
+            if policy == "greedy":
+                a = int(np.argmax(mu))
+            elif policy == "softmax":
+                a = models.choose(models.softmax(mu, beta), rng)
+            elif policy == "UCB":
+                a = int(np.argmax(ucb_values(mu, var, c)))
+            elif policy == "Thompson":
+                a = models.thompson_choice(mu, var, rng)
+            r = rng.normal(means[t, a], obs_sd)
+            mu, var = models.kalman_bandit_step(mu, var, a, r, obs_sd ** 2, drift_sd ** 2)
+            score[i, t] = means[t, a]
+    return score
+
+policies = ["greedy", "softmax", "UCB", "Thompson"]
+scores = {p: run_restless_bandit(p) for p in policies}
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+means_ = [scores[p].mean() for p in policies]
+sems_ = [scores[p].mean(axis=1).std() / np.sqrt(scores[p].shape[0]) for p in policies]
+axes[0].bar(policies, means_, yerr=sems_, color=plotting.PALETTE[:4], capsize=3)
+axes[0].set(ylabel="mean expected payoff per trial", ylim=(0.5, 0.65), title="Who earns most on a restless bandit?")
+axes[0].grid(axis="x", visible=False)
+for p in policies:
+    smooth = np.convolve(scores[p].mean(axis=0), np.ones(10) / 10, mode="valid")
+    axes[1].plot(smooth, label=p)
+axes[1].set(xlabel="trial", ylabel="expected payoff (10-trial average)", title="Payoff over time")
+axes[1].legend()
+plt.show()
+for p in policies:
+    print(f"{p:9s} {scores[p].mean():.3f} ± {sems_[policies.index(p)]:.3f}")
+
+# %% [markdown]
+The agent that seeks out its uncertainty on purpose (UCB) earns the most in this environment; the greedy and softmax agents, which cannot tell a well-known arm from a neglected one, earn less. Thompson sampling, whose exploration is random even though it is uncertainty-scaled, does *worse* than the greedy agent here — with rewards this noisy the posteriors stay wide, so its samples keep sending it to inferior arms, and that choice noise costs more than its better-targeted exploration earns. The differences are a few percent of the payoff, and which kind of exploration pays depends on the environment (how fast the arms drift, how noisy the rewards are, how many arms there are), just as the best learning rate did in lesson 3. Try changing `drift_sd`, `obs_sd` or `c` and see the ranking move.
+
+Do people explore like this? Wilson et al. (2014) separated the two components experimentally: humans show both an information bonus for less-sampled options (directed exploration) and more choice variability when uncertain (random exploration). Gershman (2018) fitted a hybrid Kalman-filter model with a UCB bonus and Thompson-like noise to bandit choices and found that both components contribute; Speekenbrink and Konstantinidis (2015) found that choices in a restless bandit were best described by a Kalman filter combined with an uncertainty-sensitive, Thompson-like choice rule. Daw et al. (2006), in contrast, found no evidence for an uncertainty bonus in their task — a reminder that the answer depends on the design.
+
+### ✏️ Exercise 11.7 — Which strategy is *directed* exploration? *(conceptual)*
+
+Which of these choice strategies implements *directed* exploration — a deliberate preference for options the agent is uncertain about?
+
+**(a)** A softmax on the posterior means with a small inverse temperature.
+**(b)** Upper-confidence-bound choice: pick the option with the largest mean + $c \times$ sd.
+**(c)** Epsilon-greedy choice.
+**(d)** Thompson sampling: draw one sample per option from its posterior and pick the largest.
+
+# %% [exercise 11.7]
+check("11.7", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 11.5 Change-points: when the world jumps
+
+The Kalman filter assumes the world *drifts* smoothly. Many tasks instead *jump*: a reversal swaps the good and bad options at once. The Bayesian answer is a **change-point model**: on every trial, with probability $h$ (the *hazard rate*) the reward probability is re-drawn from scratch; otherwise it stays. For a single probability we can do exact inference on a grid of candidate values $p_1, \dots, p_G$:
+
+1. **Predict (change-point step).** $\text{prior}(p_g) = (1 - h)\,\text{post}(p_g) + h / G$ — a little belief is spread uniformly over all values, in case a change just happened. The prediction for the next outcome is $\sum_g \text{prior}(p_g)\, p_g$.
+2. **Update.** Multiply by the likelihood of the outcome, $p_g$ if rewarded and $1 - p_g$ otherwise, and normalise.
+
+This is a simplified version of the learner of Nassar et al. (2010) and of the ideal observer of Behrens et al. (2007), who additionally *learn* the hazard rate — the step we take in lesson 12.
+
+### ✏️ Exercise 11.8 — A change-point filter on a grid *(coding)*
+
+Implement the filter. Return `(predictions, posteriors)`: the predicted reward probability *before* each outcome (shape `(n_trials,)`) and the normalised posterior *after* each outcome (shape `(n_trials, n_grid)`).
+
+# %% [exercise 11.8]
+def grid_changepoint_filter(outcomes, hazard, grid):
+    """Exact Bayesian tracking of a Bernoulli probability that may jump (hazard rate h) on a grid of values."""
+    grid = np.asarray(grid, float)
+    post = np.full(len(grid), 1.0 / len(grid))             # uniform belief before any outcome
+    predictions = np.zeros(len(outcomes))
+    posteriors = np.zeros((len(outcomes), len(grid)))
+    for t, o in enumerate(outcomes):
+        raise NotImplementedError("your code here: predict (allow a change-point), record the prediction, update with the outcome, normalise, store")
+    return predictions, posteriors
+
+check("11.8", grid_changepoint_filter)
+
+# %% [markdown]
+We test it on a probability that reverses between 0.8 and 0.2 every 40 trials, and compare its predictions with a Rescorla–Wagner learner. The lower panel shows the *effective* learning rate of each learner on each trial — the fraction of the prediction error by which the prediction moved.
+
+# %%
+grid_changepoint_filter = use("11.8", grid_changepoint_filter)
+
+n_t = 200
+p_true = np.where((np.arange(n_t) // 40) % 2 == 0, 0.8, 0.2)
+o = (rng.random(n_t) < p_true).astype(float)
+grid = np.linspace(0.01, 0.99, 99)
+pred_cp, post_cp = grid_changepoint_filter(o, hazard=1 / 40, grid=grid)
+pred_rw = models.rw_reversal_predictions(o, alpha=0.1)
+
+def effective_learning_rate(pred, outcomes):
+    """(pred[t+1] - pred[t]) / (outcome[t] - pred[t]) for each trial."""
+    return (pred[1:] - pred[:-1]) / (outcomes[:-1] - pred[:-1])
+
+fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True, height_ratios=[2, 1])
+axes[0].plot(p_true, color="#52514e", ls="--", lw=1, label="true probability")
+axes[0].plot(np.where(o == 1)[0], np.full(int(o.sum()), 1.03), "|", color="#52514e", label="rewarded trials")
+axes[0].plot(pred_cp, label="change-point learner (h = 1/40)")
+axes[0].plot(pred_rw, label="RW, α = 0.1")
+axes[0].set(ylabel="predicted P(reward)", title="Tracking reversals", ylim=(0, 1.08))
+axes[0].legend(fontsize=8, loc="lower left", ncol=2)
+axes[1].plot(effective_learning_rate(pred_cp, o), label="change-point learner")
+axes[1].axhline(0.1, color=plotting.PALETTE[1], label="RW, α = 0.1")
+for t in range(40, n_t, 40):
+    axes[1].axvline(t, color="#52514e", ls=":", lw=0.8)
+axes[1].set(xlabel="trial", ylabel="effective learning rate", ylim=(0, 0.8))
+axes[1].legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+The change-point learner's learning rate is not a constant: it collapses during stable stretches (it has learned the probability and trusts it) and **spikes after a surprising outcome**, when the posterior's mass shifts towards "something changed". The whole posterior tells the story even better:
+
+# %%
+fig, ax = plt.subplots(figsize=(9, 3.6))
+im = ax.imshow(post_cp.T, aspect="auto", origin="lower", extent=[0, n_t, grid[0], grid[-1]], cmap=plotting.SEQUENTIAL)
+ax.plot(p_true, color=plotting.PALETTE[7], ls="--", lw=1.2, label="true probability")
+ax.set(xlabel="trial", ylabel="P(reward)", title="Posterior over the reward probability, trial by trial")
+ax.grid(False)
+ax.legend(loc="upper right", fontsize=8)
+plt.colorbar(im, ax=ax, label="posterior density")
+plt.show()
+
+# %% [markdown]
+After each reversal the posterior is briefly *wide* — the learner knows that it does not know — and then sharpens again. Nassar et al. (2010) showed that people's updating follows this pattern closely, and derived an "approximately Bayesian" delta rule whose learning rate rises with the probability that a change has just occurred; the volatility learners of lesson 12 go one step further and estimate how often changes happen.
+
+## 11.6 A cheap approximation: Pearce–Hall
+
+Long before these Bayesian models, Pearce and Hall (1980) proposed that the amount learned about a cue depends on how *surprising* its outcomes have recently been. Their rule keeps, alongside the value $V$, an **associability** $\eta$-weighted average of recent absolute prediction errors:
+
+$$
+\delta = R - V, \qquad V \leftarrow V + \kappa\,A\,\delta, \qquad A \leftarrow \eta\,|\delta| + (1 - \eta)\,A .
+$$
+
+The associability $A$ plays the role of the learning rate: it rises when outcomes are surprising (after a change) and decays when they are predictable (in a stable period) — the same profile as the change-point learner's effective learning rate, obtained without any explicit uncertainty computation. Hybrid RW/Pearce–Hall models fit conditioning data well, and their learning-rate signal has been linked to the amygdala (Li et al. 2011).
+
+### ✏️ Exercise 11.9 — The Pearce–Hall hybrid *(coding)*
+
+Implement one Pearce–Hall step. Return `(v_new, assoc_new, delta)`, updating the value with the *current* associability and then updating the associability.
+
+# %% [exercise 11.9]
+def pearce_hall_update(v, assoc, reward, eta, kappa):
+    """Pearce–Hall (1980) hybrid: the associability tracks recent |prediction errors| and scales learning."""
+    delta = ...              # <- the prediction error
+    v_new = ...              # <- value update scaled by kappa * assoc
+    assoc_new = ...          # <- running average of |delta| with rate eta
+    return v_new, assoc_new, delta
+
+check("11.9", pearce_hall_update)
+
+# %%
+pearce_hall_update = use("11.9", pearce_hall_update)
+
+v, assoc = 0.5, 1.0
+hist_v, hist_a = [], []
+for r in o:
+    hist_v.append(v); hist_a.append(assoc)
+    v, assoc, delta = pearce_hall_update(v, assoc, r, eta=0.3, kappa=0.5)
+
+fig, axes = plt.subplots(2, 1, figsize=(9, 5.5), sharex=True)
+axes[0].plot(p_true, color="#52514e", ls="--", lw=1, label="true probability")
+axes[0].plot(hist_v, label="Pearce–Hall value V")
+axes[0].plot(pred_cp, alpha=0.6, label="change-point learner")
+axes[0].set(ylabel="predicted P(reward)", title="Pearce–Hall on the same reversal task (η = 0.3, κ = 0.5)")
+axes[0].legend(fontsize=8, loc="lower left")
+axes[1].plot(hist_a, color=plotting.PALETTE[3], label="associability A")
+for t in range(40, n_t, 40):
+    axes[1].axvline(t, color="#52514e", ls=":", lw=0.8)
+axes[1].set(xlabel="trial", ylabel="associability", ylim=(0, 1.05))
+axes[1].legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+The associability jumps after each reversal and decays as the new contingency becomes predictable: a heuristic version of the Bayesian learner's uncertainty. Yu and Dayan (2005) made the correspondence explicit — *expected* uncertainty (the known noise of outcomes) should lower learning rates, *unexpected* uncertainty (surprises that signal change) should raise them — and proposed that two neuromodulators, acetylcholine and noradrenaline, signal the two kinds.
+
+### ✏️ Exercise 11.10 — Why the learning rate should change *(conceptual, written)*
+
+In 2–4 sentences and in Bayesian terms: why should the learning rate be high just after a change in the environment and low during a long stable period? Write your answer in the string below.
+
+# %% [exercise 11.10]
+check("11.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A Bayesian learner's **learning rate is its relative uncertainty**: the uncertainty of its estimate divided by that plus the noise of the outcomes. It shrinks as evidence accumulates and should rise again after a change.
+- The **Beta–Bernoulli** learner is a delta rule with learning rate $1/(a + b + 1)$; **forgetting** stops the rate from shrinking.
+- The **Kalman filter** does the same for continuous, drifting payoffs; its gain decays to zero without process noise and to a steady value with it (Exercise 11.5), which is why it behaves like RW in the long run.
+- Uncertainty also drives **exploration**: UCB adds an information bonus (directed), Thompson sampling adds uncertainty-scaled randomness; humans show both kinds (Wilson et al. 2014; Gershman 2018).
+- A **change-point** learner's effective learning rate spikes after surprising outcomes and collapses during stable periods; the posterior widens and narrows accordingly.
+- **Pearce–Hall** approximates this with a surprise-driven associability — no explicit uncertainty needed.
+
+## What's next
+
+All the learners here were told how changeable the world is (a decay, a process variance, a hazard rate). Lesson 12 introduces learners that **estimate volatility** from experience — Behrens et al.'s ideal observer, the volatile Kalman filter of Piray and Daw (2020) and the Hierarchical Gaussian Filter — and shows how to fit them to choices.
+
+## References
+
+- Kalman, R. E. (1960). A new approach to linear filtering and prediction problems. *Journal of Basic Engineering, 82*(1), 35–45. https://doi.org/10.1115/1.3662552
+- Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. *Biometrika, 25*(3–4), 285–294. https://doi.org/10.1093/biomet/25.3-4.285
+- Auer, P., Cesa-Bianchi, N., & Fischer, P. (2002). Finite-time analysis of the multiarmed bandit problem. *Machine Learning, 47*, 235–256. https://doi.org/10.1023/A:1013689704352
+- Pearce, J. M., & Hall, G. (1980). A model for Pavlovian learning: Variations in the effectiveness of conditioned but not of unconditioned stimuli. *Psychological Review, 87*(6), 532–552. https://doi.org/10.1037/0033-295X.87.6.532
+- Yu, A. J., & Dayan, P. (2005). Uncertainty, neuromodulation, and attention. *Neuron, 46*(4), 681–692. https://doi.org/10.1016/j.neuron.2005.04.026
+- Daw, N. D., O'Doherty, J. P., Dayan, P., Seymour, B., & Dolan, R. J. (2006). Cortical substrates for exploratory decisions in humans. *Nature, 441*, 876–879. https://doi.org/10.1038/nature04766
+- Behrens, T. E. J., Woolrich, M. W., Walton, M. E., & Rushworth, M. F. S. (2007). Learning the value of information in an uncertain world. *Nature Neuroscience, 10*, 1214–1221. https://doi.org/10.1038/nn1954
+- Nassar, M. R., Wilson, R. C., Heasly, B., & Gold, J. I. (2010). An approximately Bayesian delta-rule model explains the dynamics of belief updating in a changing environment. *Journal of Neuroscience, 30*(37), 12366–12378. https://doi.org/10.1523/JNEUROSCI.0822-10.2010
+- Li, J., Schiller, D., Schoenbaum, G., Phelps, E. A., & Daw, N. D. (2011). Differential roles of human striatum and amygdala in associative learning. *Nature Neuroscience, 14*, 1250–1252. https://doi.org/10.1038/nn.2904
+- Wilson, R. C., Geana, A., White, J. M., Ludvig, E. A., & Cohen, J. D. (2014). Humans use directed and random exploration to solve the explore–exploit dilemma. *Journal of Experimental Psychology: General, 143*(6), 2074–2081. https://doi.org/10.1037/a0038199
+- Speekenbrink, M., & Konstantinidis, E. (2015). Uncertainty and exploration in a restless bandit problem. *Topics in Cognitive Science, 7*(2), 351–367. https://doi.org/10.1111/tops.12145
+- Gershman, S. J. (2015). A unifying probabilistic view of associative learning. *PLoS Computational Biology, 11*(11), e1004567. https://doi.org/10.1371/journal.pcbi.1004567
+- Gershman, S. J. (2018). Deconstructing the human algorithms for exploration. *Cognition, 173*, 34–42. https://doi.org/10.1016/j.cognition.2017.12.014
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.), chapter 2 (bandits, UCB). MIT Press. http://incompleteideas.net/book/the-book-2nd.html

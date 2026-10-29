@@ -1,0 +1,392 @@
+# %% [markdown]
+# Lesson 1 — Thinking like a modeller: tasks, agents and simulation
+
+A verbal theory says *people learn from reward*. A computational model says exactly **how**: it is a recipe that takes what a participant has experienced and produces what the participant will do next. Because the recipe is precise, we can run it — *simulate* it — and watch the behaviour it generates, long before we ever fit it to data. This habit, **simulate first**, is the single most important thing this lesson teaches.
+
+You will build a simple task (a two-armed bandit), make two simple agents play it, learn to describe their behaviour with model-agnostic summaries, and place all of this inside the modelling cycle that the rest of the course follows.
+
+**What you will learn**
+
+- the four ingredients of a computational model: a task, an agent, parameters and noise — and how to tell task variables, parameters and data apart,
+- how to simulate a task and simple agents (a random chooser and win-stay/lose-shift), and why the observe → choose → outcome loop is the skeleton of every simulation,
+- model-agnostic summaries of behaviour: reward rate, learning curves and stay probabilities,
+- reproducibility: random number generators and seeds,
+- the modelling cycle of Wilson & Collins (2019) and where each lesson of this course sits in it.
+
+**Prerequisites:** lesson 0 (setup) and basic Python/NumPy.
+
+**Estimated time:** 1.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 1.1 What is a model?
+
+Every model in this course has the same four ingredients.
+
+| ingredient | what it is | example in a bandit task | who knows it? |
+|---|---|---|---|
+| **task** (environment) | a generative process: what the participant observes in response to each action | two options; option A pays with probability 0.7, option B with 0.3 | the experimenter |
+| **agent** (hypothesis) | the computations that turn experience into choices | "keep a value for each option, update it from the outcome, choose the better one most of the time" | this is the theory under test |
+| **parameters** | numbers the hypothesis leaves free, which may differ between people | a learning rate, an inverse temperature | nobody — we estimate them from behaviour |
+| **noise** | the model gives *probabilities* of choices, not certainties | "choose A with probability 0.8" | — |
+
+Three kinds of numbers appear in any modelling project, and confusing them is the most common beginner's error:
+
+- **task variables** are set by the experimenter (reward probabilities, number of trials),
+- **data** are what we observe (the sequence of choices and rewards),
+- **parameters** are properties of the agent that we do not observe and must infer (e.g. how fast it learns).
+
+A model also contains **latent variables**: quantities the agent computes internally (the value of each option on each trial) that are neither set by the experimenter nor directly observed. Much of computational neuroscience consists of looking for these latent variables in brain activity.
+
+### ✏️ Exercise 1.1 — Task variable, parameter or data? *(conceptual)*
+
+Which of the following is a *parameter* of a model of a participant?
+
+**(a)** the reward probability of option A
+**(b)** the number of trials in the experiment
+**(c)** the participant's learning rate
+**(d)** the sequence of rewards the participant received
+
+# %% [exercise 1.1]
+check("1.1", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 1.2 Simulating a task
+
+The task we use throughout the course is the **two-armed bandit** (the name comes from slot machines, "one-armed bandits"): on each trial the participant chooses one of two options and receives a reward (1) or nothing (0). Option A pays with probability $p_A = 0.7$, option B with $p_B = 0.3$. The participant is never told these numbers.
+
+The course package provides the task as `tasks.Bandit`. Its `step(action)` method draws a reward for the chosen option (0 = A, 1 = B). We pass it `rng`, the random number generator fixed in the setup cell, so that every run of this notebook produces exactly the same numbers (section 1.5 explains why that matters).
+
+# %%
+bandit = tasks.Bandit(probs=[0.7, 0.3], rng=rng)
+
+outcomes_A = np.array([bandit.step(0) for _ in range(20)])     # choose option A twenty times
+print("20 outcomes of option A:", outcomes_A.astype(int))
+print("proportion rewarded:", outcomes_A.mean())
+
+# %% [markdown]
+Under the hood a Bernoulli outcome with probability $p$ is drawn by comparing a uniform random number with $p$: `rng.random()` returns a number between 0 and 1, and it is below $p$ exactly with probability $p$. You will write this line yourself many times:
+
+# %%
+p = 0.7
+draws = rng.random(10)                      # ten uniform random numbers in [0, 1)
+print("uniform draws:", np.round(draws, 2))
+print("outcome = draw < p:", (draws < p).astype(int))
+
+# %% [markdown]
+Notice that 20 outcomes of a 70% option gave a proportion that is not exactly 0.7. How many outcomes does an observer need before the proportion is close to $p$? The **running mean** — the mean of all outcomes seen so far, recomputed after each trial — is exactly the estimate such an observer would hold at every point in time.
+
+### ✏️ Exercise 1.2 — The running mean *(coding)*
+
+Complete the function: for a sequence `x`, return an array whose entry $t$ is the mean of `x[0]`, …, `x[t]`.
+
+# %% [exercise 1.2]
+def running_mean(x):
+    """Running (cumulative) mean of a sequence: out[t] = mean(x[:t+1])."""
+    x = np.asarray(x, dtype=float)
+    partial_sums = ...                        # <- the sum of the first 1, 2, 3, ... entries (np.cumsum)
+    n_seen = ...                              # <- how many entries have been seen at each point: 1, 2, 3, ...
+    return partial_sums / n_seen
+
+check("1.2", running_mean)
+
+# %% [markdown]
+Let's watch five observers, each seeing a different sequence of outcomes from the same 70% option. The shaded band shows $\pm 2$ standard deviations of the proportion after $n$ outcomes, $\sqrt{p(1-p)/n}$: the *law of large numbers* in action — estimates converge, but slowly.
+
+# %%
+running_mean = use("1.2", running_mean)      # your function if it passes the check, else the reference
+
+n_outcomes = 300
+fig, ax = plt.subplots(figsize=(7.5, 4))
+for seed in range(5):
+    observer_rng = np.random.default_rng(seed)
+    outcomes = (observer_rng.random(n_outcomes) < 0.7).astype(float)
+    ax.plot(running_mean(outcomes), lw=1.3, label=f"observer {seed + 1}")
+n = np.arange(1, n_outcomes + 1)
+sd = np.sqrt(0.7 * 0.3 / n)
+ax.fill_between(n - 1, 0.7 - 2 * sd, 0.7 + 2 * sd, color="#52514e", alpha=0.12, label="±2 SD")
+ax.axhline(0.7, ls="--", color="#52514e", lw=1, label="true p = 0.7")
+ax.set(xlabel="number of outcomes seen", ylabel="running mean (estimate of p)", ylim=(0, 1),
+       title="Estimating a reward probability from outcomes: slow convergence")
+ax.legend(ncol=3, fontsize=8, loc="lower right")
+plt.show()
+
+# %% [markdown]
+After 20 outcomes the estimate can still easily be 0.55 or 0.85; after 100 it is usually within $\pm 0.1$. Learning from noisy outcomes is genuinely hard, and every model in this course is a proposal for how people do it with limited data.
+
+### ✏️ Exercise 1.3 — Expected reward of a random chooser *(maths)*
+
+An agent chooses A or B with probability 0.5 each on the bandit above ($p_A = 0.7$, $p_B = 0.3$). What is its expected reward per trial?
+
+# %% [exercise 1.3]
+answer = None   # <- your number
+check("1.3", answer)
+
+# %% [markdown]
+### ✏️ Exercise 1.4 — Three failures in a row *(maths)*
+
+What is the probability that option A ($p_A = 0.7$) fails to pay on three consecutive trials?
+
+# %% [exercise 1.4]
+answer = None   # <- your number
+check("1.4", answer)
+
+# %% [markdown]
+## 1.3 Simulating simple agents
+
+An **agent** is a rule — a *policy* — that maps the history of the task to a probability for each option. Simulating an agent means running the loop
+
+```
+for each trial:
+    choose an option (according to the policy)
+    observe the outcome (the task responds)
+    store both (and let the agent update whatever it keeps track of)
+```
+
+This loop is the skeleton of every simulation in the course; only the *choose* and *update* steps change from model to model.
+
+The simplest agent has no memory at all: it picks each option with equal probability. It earns the average of the two reward probabilities (exercise 1.3), which makes it the baseline that every learning model must beat.
+
+### ✏️ Exercise 1.5 — Simulate a random agent *(coding)*
+
+Complete the simulation loop. Return a dictionary with `choices` (an integer array of 0-based option indices) and `rewards` (a float array of 0.0/1.0). Use `rng.integers(n_arms)` to draw a random option and `float(rng.random() < probs[c])` for its reward.
+
+The checker does not require the same random numbers as the reference solution: it checks that every option is chosen about equally often and that rewards follow `probs`.
+
+# %% [exercise 1.5]
+def simulate_random_agent(probs, n_trials, rng):
+    """An agent that chooses every option with equal probability.
+
+    Returns dict(choices=int array, rewards=float array)."""
+    probs = np.asarray(probs, dtype=float)
+    n_arms = len(probs)
+    choices = np.zeros(n_trials, dtype=int)
+    rewards = np.zeros(n_trials)
+    for t in range(n_trials):
+        c = ...                                 # <- a random option index
+        r = ...                                 # <- its Bernoulli reward
+        choices[t], rewards[t] = c, r
+    return {"choices": choices, "rewards": rewards}
+
+check("1.5", simulate_random_agent)
+
+# %% [markdown]
+A second classic agent is **win-stay / lose-shift (WSLS)**: repeat the previous choice if it was rewarded, otherwise switch. It keeps no values and reacts only to the last outcome, yet it is a serious candidate model of behaviour (Wilson & Collins, 2019, use it as one of their example models) and a useful foil for the learning models of lesson 3.
+
+### ✏️ Exercise 1.6 — Simulate a win-stay / lose-shift agent *(coding)*
+
+Implement the rule. The first choice is random (there is no history yet). After a reward, repeat `choices[t - 1]`; after no reward, switch to any *other* option (with two options that is `1 - choices[t - 1]`; for the general case `rng.choice` among the other indices works).
+
+The checker verifies the rule trial by trial: every rewarded trial must be followed by a repeat, every unrewarded trial by a switch.
+
+# %% [exercise 1.6]
+def simulate_wsls(probs, n_trials, rng):
+    """Win-stay / lose-shift: repeat the last choice after a reward, switch to
+    another option after no reward (the first choice is random).
+
+    Returns dict(choices=int array, rewards=float array)."""
+    probs = np.asarray(probs, dtype=float)
+    n_arms = len(probs)
+    choices = np.zeros(n_trials, dtype=int)
+    rewards = np.zeros(n_trials)
+    for t in range(n_trials):
+        raise NotImplementedError("your code here: decide c from choices[t-1] and rewards[t-1], draw r, store both")
+    return {"choices": choices, "rewards": rewards}
+
+check("1.6", simulate_wsls)
+
+# %% [markdown]
+Let's compare the two agents over 200 trials, together with an *oracle* that always chooses A and therefore earns 0.7 per trial on average.
+
+# %%
+simulate_random_agent = use("1.5", simulate_random_agent)
+simulate_wsls = use("1.6", simulate_wsls)
+
+probs = [0.7, 0.3]
+n_trials = 200
+random_data = simulate_random_agent(probs, n_trials, rng)
+wsls_data = simulate_wsls(probs, n_trials, rng)
+
+print(f"reward rate over {n_trials} trials:  random agent {random_data['rewards'].mean():.2f}   "
+      f"WSLS agent {wsls_data['rewards'].mean():.2f}   oracle (always A) ≈ 0.70")
+
+fig, ax = plt.subplots(figsize=(7.5, 4))
+ax.plot(np.cumsum(random_data["rewards"]), label="random agent")
+ax.plot(np.cumsum(wsls_data["rewards"]), label="win-stay / lose-shift")
+ax.plot(0.7 * np.arange(1, n_trials + 1), ls="--", color="#52514e", label="oracle (always A), expected")
+ax.set(xlabel="trial", ylabel="cumulative reward", title="Two agents on the 70/30 bandit")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+## 1.4 Describing behaviour without a model
+
+A single run tells us little: both curves are noisy. Modellers therefore describe behaviour with **summary statistics** that average over trials, agents or participants, and that do not depend on any model. Three are used constantly:
+
+1. the **reward rate** (or accuracy): the fraction of trials on which the agent chose the better option;
+2. the **learning curve**: the probability of choosing the better option on each trial, averaged over many agents (or participants);
+3. **stay probabilities**: how often the agent repeats its previous choice, split by whether that choice was rewarded.
+
+These *model-agnostic* measures matter for two reasons. They are what we look at first in any data set, and — once we have fitted a model — they are what we use to check that the model reproduces the behaviour (lessons 6, 7 and 9).
+
+Here is a learning curve for both agents, averaged over 500 simulated runs:
+
+# %%
+def learning_curve(simulate, n_agents=500, n_trials=100, probs=(0.7, 0.3)):
+    """P(choose the best option) on each trial, averaged over simulated agents."""
+    best = int(np.argmax(probs))
+    chose_best = np.zeros((n_agents, n_trials))
+    for i in range(n_agents):
+        data = simulate(probs, n_trials, rng)
+        chose_best[i] = data["choices"] == best
+    return chose_best.mean(axis=0)
+
+fig, ax = plt.subplots(figsize=(7.5, 3.8))
+ax.plot(learning_curve(simulate_random_agent), label="random agent")
+ax.plot(learning_curve(simulate_wsls), label="win-stay / lose-shift")
+ax.axhline(0.5, color="#52514e", lw=0.8, ls=":")
+ax.set(xlabel="trial", ylabel="P(choose the best option)", ylim=(0.3, 1.0), title="Learning curves (500 simulated agents each)")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+The random agent sits at 0.5. WSLS jumps to about 0.7 on the second trial and stays there: it never *learns* in the sense of accumulating evidence, so its curve is flat. A learning agent (lesson 3) produces a curve that rises over trials — the shape of the learning curve is itself a signature of the mechanism.
+
+### ✏️ Exercise 1.7 — Stay probabilities *(coding)*
+
+Compute $P(\text{stay} \mid \text{previous trial rewarded})$ and $P(\text{stay} \mid \text{previous trial not rewarded})$, where "stay" on trial $t$ means that the choice on trial $t$ equals the choice on trial $t-1$. Return them as a tuple in that order.
+
+# %% [exercise 1.7]
+def stay_probabilities_bandit(choices, rewards):
+    """P(repeat the previous choice | previous trial rewarded) and
+    P(repeat | previous trial not rewarded).  Returns a tuple (p_stay_win, p_stay_lose)."""
+    choices = np.asarray(choices)
+    rewards = np.asarray(rewards, dtype=float)
+    stay = ...                                  # <- boolean array for trials 1..T-1: did trial t repeat trial t-1?
+    previous_rewarded = ...                     # <- boolean array for the same trials: was trial t-1 rewarded?
+    p_stay_win = ...
+    p_stay_lose = ...
+    return float(p_stay_win), float(p_stay_lose)
+
+check("1.7", stay_probabilities_bandit)
+
+# %%
+stay_probabilities_bandit = use("1.7", stay_probabilities_bandit)
+
+fig, ax = plt.subplots(figsize=(5, 3.6))
+for i, (name, data) in enumerate([("random agent", random_data), ("win-stay / lose-shift", wsls_data)]):
+    p_win, p_lose = stay_probabilities_bandit(data["choices"], data["rewards"])
+    print(f"{name:22s}: P(stay | rewarded) = {p_win:.2f}   P(stay | not rewarded) = {p_lose:.2f}")
+    ax.bar(np.array([0, 1]) + (i - 0.5) * 0.36, [p_win, p_lose], 0.36, label=name)
+ax.set(xticks=[0, 1], xticklabels=["previous trial rewarded", "previous trial not rewarded"],
+       ylabel="P(repeat previous choice)", ylim=(0, 1.05), title="Stay probabilities of the two agents")
+ax.legend(fontsize=9)
+ax.grid(axis="x", visible=False)
+plt.show()
+
+# %% [markdown]
+The random agent repeats itself half the time whatever happened; WSLS repeats after every reward and never after a non-reward. Real participants fall in between — and so does a learner with values (lesson 3). Summary statistics describe behaviour, but they rarely identify the mechanism by themselves; that is what model fitting (lesson 5) and model comparison (lesson 7) are for.
+
+### ✏️ Exercise 1.8 — The long-run reward rate of win-stay / lose-shift *(maths)*
+
+On the 70/30 bandit, what reward rate does the WSLS agent achieve in the long run? You can reason it out (what is the probability that the agent chooses A on a given trial, once it has been playing for a while?) or simulate many thousands of trials with your `simulate_wsls` and take the mean reward; either way, enter the number.
+
+# %% [exercise 1.8]
+answer = None   # <- your number
+check("1.8", answer)
+
+# %% [markdown]
+## 1.5 Reproducibility: random number generators and seeds
+
+Simulations are random, so two runs normally give different numbers. For teaching, debugging and reproducible science we want to control that randomness. NumPy's `np.random.default_rng(seed)` creates a **generator**: the same seed always produces the same sequence of numbers.
+
+# %%
+a = np.random.default_rng(42).random(5)
+b = np.random.default_rng(42).random(5)
+c = np.random.default_rng(43).random(5)
+print("same seed, same numbers:     ", np.allclose(a, b))
+print("different seed, same numbers:", np.allclose(a, c))
+
+# %% [markdown]
+Three conventions, used in every notebook of the course:
+
+1. **One generator per notebook**, created in the setup cell (`rng = np.random.default_rng(2024)`), so that the whole notebook is reproducible when run top to bottom.
+2. **Pass `rng` into every function** that needs randomness (`simulate_wsls(probs, n_trials, rng)`) rather than calling a global random function. This makes it explicit which code is stochastic and lets you give a function its own generator when you want a fresh, independent stream (as `learning_curve` could, or as the five observers in section 1.2 did).
+3. **Vectorise draws when you can**: `rng.random(n) < p` draws $n$ outcomes at once, which is much faster than a Python loop. The trial-by-trial loop is still needed whenever the next choice depends on what happened before — which is the case for every learning agent.
+
+Re-running a cell that uses `rng` continues the stream from where it left off, so results change until you re-run the setup cell; that is expected.
+
+## 1.6 The modelling cycle
+
+Wilson and Collins (2019) distilled the workflow of computational modelling into ten rules. Stripped to its skeleton, their cycle is:
+
+```
+design the task  →  build candidate models  →  SIMULATE them  →  check parameter recovery
+      ↑                                                                    ↓
+interpret & relate to neural / clinical data  ←  validate  ←  compare models  ←  fit to data  ←  check model recovery
+```
+
+Where each step is taught in this course:
+
+| step | what it means | lesson |
+|---|---|---|
+| build models | write the agent as equations and code | 3, 4, 9–13 |
+| simulate | run the model with known parameters; look at its behaviour | 1, 3 (and every lesson after) |
+| fit to data | find the parameters under which the observed choices are most probable | 5, 8 |
+| parameter recovery | fit simulated data; can we get the parameters back? | 6 |
+| model recovery | fit all candidate models to data simulated from each; can we tell them apart? | 6 |
+| compare models | which candidate explains the data best, penalising complexity? | 7 |
+| validate | does the fitted model reproduce the summary statistics of the data? | 6, 7, 9 |
+| interpret | relate parameters to symptoms, brain activity, groups | 14, 15 |
+
+The order matters. In particular, **simulating comes before fitting**, every time, for reasons the next two exercises ask you to articulate. Palminteri, Wyart and Koechlin (2017) add a sharper point: comparing models by fit alone is not enough — a good model must also *reproduce the qualitative patterns* in the data, and the modeller should actively try to falsify it.
+
+### ✏️ Exercise 1.9 — Why simulate before fitting? *(conceptual)*
+
+Why does the modelling cycle insist on simulating a model *before* fitting it to data?
+
+**(a)** Because the simulated choices are what we fit the model to, instead of collecting data.
+**(b)** To see what each parameter does to behaviour, to catch bugs, and to find out whether the parameters can be recovered from data at all.
+**(c)** Because fitting a model requires it to generate the same choices as the participant.
+**(d)** To remove the randomness from the model so that it makes deterministic predictions.
+
+# %% [exercise 1.9]
+check("1.9", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+### ✏️ Exercise 1.10 — Fitting without simulating *(conceptual, written)*
+
+In 2–4 sentences: what could go wrong if you fitted a model to participants' data without ever simulating it? Write your answer in the string below; the checker looks for the key ideas and then shows a model answer to compare with.
+
+# %% [exercise 1.10]
+check("1.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A computational model has four ingredients: a **task** (generative process, set by the experimenter), an **agent** (the hypothesis, written as computations), **parameters** (free numbers that differ between people and are estimated from data) and **noise** (choices are probabilistic). Keep task variables, parameters and data apart.
+- Simulating an agent is a loop: *choose → observe the outcome → store/update*. The **random agent** is the baseline (reward rate = mean of the reward probabilities); **win-stay/lose-shift** is a memoryless heuristic that reacts to the last outcome.
+- Behaviour is described model-agnostically with **reward rates, learning curves and stay probabilities**; these summaries rarely identify the mechanism on their own, but every model must reproduce them.
+- Use **one seeded generator per notebook** and pass `rng` into every stochastic function.
+- The **modelling cycle**: design → build → simulate → parameter recovery → model recovery → fit → compare → validate → interpret. Simulate before you fit.
+
+## What's next
+
+Lesson 2 supplies the probability you need to turn "simulate" around into "fit": distributions, likelihoods and Bayes' rule, all on the example of estimating a single reward probability. Lesson 3 then builds the first real learning agent, the Rescorla–Wagner learner.
+
+## References
+
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547
+- Palminteri, S., Wyart, V., & Koechlin, E. (2017). The importance of falsification in computational cognitive modeling. *Trends in Cognitive Sciences, 21*(6), 425–433. https://doi.org/10.1016/j.tics.2017.03.011
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.), chapter 2 (multi-armed bandits). MIT Press. http://incompleteideas.net/book/the-book-2nd.html
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press.

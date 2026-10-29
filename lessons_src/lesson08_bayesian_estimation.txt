@@ -1,0 +1,624 @@
+# %% [markdown]
+# Lesson 8 — Bayesian parameter estimation and hierarchical models
+
+Maximum likelihood (lesson 5) returns a single "best" value for each parameter and nothing else. That is often not enough. With few trials the best value can be absurd (an inverse temperature of 400), we have no idea how uncertain the estimate is, and every participant is fitted as if the others did not exist. **Bayesian estimation** fixes all three problems: a *prior* expresses which parameter values are plausible, the *posterior* describes what the data allow, and a *hierarchical* model lets participants inform one another.
+
+This lesson builds the machinery from the ground up — priors and maximum a posteriori (MAP) estimates, the Laplace approximation, a Markov chain Monte Carlo (MCMC) sampler you write yourself, the empirical-Bayes EM algorithm used in many papers, and finally a full hierarchical model in PyMC — so that the tools used in the field stop being black boxes.
+
+**What you will learn**
+
+- why maximum likelihood misbehaves with few trials, and how a prior regularises the estimate,
+- how to write the log posterior of a trial-by-trial model and find its MAP estimate,
+- how to quantify uncertainty with the Laplace approximation and with Metropolis–Hastings sampling,
+- what a hierarchical model is, what *shrinkage* does, and how the EM algorithm of Huys et al. (2011) estimates the group distribution,
+- how the same model looks in a probabilistic programming language (PyMC), and which tools (HBI, hBayesDM) the field uses.
+
+**Prerequisites:** lessons 2 (Bayes' rule, priors and posteriors), 3 and 5 (the RW model and its likelihood); lesson 6 is useful.
+
+**Estimated time:** 3 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 8.1 From point estimates to posteriors
+
+Let's reproduce a problem that every modeller meets. We simulate 60 participants who all have the **same** true parameters ($\alpha = 0.3$, $\beta = 5$) but complete only 30 trials each, and fit every one of them by maximum likelihood exactly as in lesson 5.
+
+# %%
+true_alpha, true_beta = 0.3, 5.0
+n_subj, n_trials_small = 60, 30
+small_data = [models.simulate_rw_bandit([0.7, 0.3], true_alpha, true_beta, n_trials_small, rng) for _ in range(n_subj)]
+
+with np.errstate(over="ignore"):                      # the optimiser occasionally tries absurd values of exp(x)
+    mle = np.array([fitting.fit_mle(models.nll_rw, (d["choices"], d["rewards"]), ["unit", "pos"], n_starts=3, rng=rng)["params"]
+                    for d in small_data])
+
+print(f"true alpha = {true_alpha}, MLE alpha: median {np.median(mle[:, 0]):.2f}, range {mle[:, 0].min():.2f}–{mle[:, 0].max():.2f}")
+print(f"true beta  = {true_beta}, MLE beta:  median {np.median(mle[:, 1]):.1f}, max {mle[:, 1].max():.0f}; "
+      f"{np.mean(mle[:, 1] > 50):.0%} of the fits have beta > 50")
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+axes[0].hist(mle[:, 0], bins=20, edgecolor="white")
+axes[0].axvline(true_alpha, color=plotting.PALETTE[7], ls="--", label="true value")
+axes[0].set(xlabel="MLE of α", ylabel="number of participants", title="Learning rate, 30 trials each")
+axes[1].hist(np.log10(mle[:, 1]), bins=20, edgecolor="white")
+axes[1].axvline(np.log10(true_beta), color=plotting.PALETTE[7], ls="--", label="true value")
+axes[1].set(xlabel="log10 of the MLE of β", title="Inverse temperature, 30 trials each")
+for ax in axes:
+    ax.legend()
+plt.show()
+
+# %% [markdown]
+Although every participant has $\beta = 5$, the estimates spread over orders of magnitude and some are enormous. Nothing went wrong with the optimiser: these participants happened to choose consistently, and for near-deterministic data the likelihood simply **keeps increasing with $\beta$** — there is no maximum to find.
+
+### ✏️ Exercise 8.1 — A suspicious maximum-likelihood estimate *(conceptual)*
+
+A participant completed only 30 trials and chose the same option on 28 of them. Maximum likelihood gives $\beta \approx 400$. What is the most likely explanation?
+
+**(a)** The participant really is extraordinarily consistent, so $\beta$ is genuinely huge.
+**(b)** With so few, near-deterministic choices the likelihood keeps increasing as $\beta$ grows, so the estimate drifts to the boundary: the data cannot pin $\beta$ down.
+**(c)** The optimiser got stuck; a few random restarts would give a sensible value.
+**(d)** $\alpha$ must have been estimated as exactly 0.
+
+# %% [exercise 8.1]
+check("8.1", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+Here is what the likelihood of the most extreme participant looks like as a function of $\beta$ (with $\alpha$ fixed at its estimate):
+
+# %%
+worst = int(np.argmax(mle[:, 1]))
+d = small_data[worst]
+betas = np.logspace(-1, 3, 60)
+nll_curve = [models.nll_rw((mle[worst, 0], b), d["choices"], d["rewards"]) for b in betas]
+fig, ax = plt.subplots(figsize=(6.5, 3.4))
+ax.semilogx(betas, nll_curve)
+ax.set(xlabel="β (log scale)", ylabel="negative log-likelihood", title=f"Participant {worst}: the likelihood never stops improving")
+plt.show()
+
+# %% [markdown]
+Three things are wrong with a bare point estimate, and the rest of the lesson addresses each:
+
+1. **No regularisation.** Nothing tells the fit that $\beta = 400$ is implausible. A *prior* does (sections 8.2–8.3).
+2. **No uncertainty.** Is $\beta = 4$ or $\beta = 40$? The *posterior distribution* answers this (section 8.4).
+3. **No pooling.** Sixty participants were fitted as sixty unrelated problems, although they come from one population. A *hierarchical model* lets them share information (sections 8.5–8.6).
+
+## 8.2 Priors and the maximum a posteriori (MAP) estimate
+
+Bayes' rule (lesson 2) applied to parameters $\theta$ and data $D$ reads
+
+$$
+p(\theta \mid D) = \frac{p(D \mid \theta)\,p(\theta)}{p(D)} \qquad\Longrightarrow\qquad
+\log p(\theta \mid D) = \underbrace{\log p(D \mid \theta)}_{\text{log-likelihood}} + \underbrace{\log p(\theta)}_{\text{log prior}} + \text{const.}
+$$
+
+The log-likelihood is exactly the quantity you computed in lesson 5 (minus the negative log-likelihood `nll_rw`). The prior is new. We place it on the **unconstrained** parameters introduced in lesson 5,
+
+$$
+x_\alpha = \operatorname{logit}(\alpha), \qquad x_\beta = \log \beta, \qquad x_\alpha \sim \mathcal{N}(\mu_\alpha, s_\alpha^2), \quad x_\beta \sim \mathcal{N}(\mu_\beta, s_\beta^2),
+$$
+
+because Normal distributions on the real line are convenient, and because the hierarchical models later in the lesson use exactly these Normals as group distributions. Let's see what a "weakly informative" prior — $\mathcal{N}(0, 1.5^2)$ on $x_\alpha$ and $\mathcal{N}(1, 1^2)$ on $x_\beta$ — implies on the scale of $\alpha$ and $\beta$:
+
+# %%
+mu_prior, sd_prior = np.array([0.0, 1.0]), np.array([1.5, 1.0])
+prior_draws = rng.normal(mu_prior, sd_prior, size=(20000, 2))
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].hist(models.sigmoid(prior_draws[:, 0]), bins=40, density=True, edgecolor="white")
+axes[0].set(xlabel="α", ylabel="prior density", title="Prior on α implied by logit(α) ~ N(0, 1.5²)")
+axes[1].hist(np.exp(prior_draws[:, 1]), bins=np.linspace(0, 30, 60), density=True, edgecolor="white")
+axes[1].set(xlabel="β", title="Prior on β implied by log β ~ N(1, 1²)")
+plt.show()
+print(f"95% of the prior mass on beta lies between {np.percentile(np.exp(prior_draws[:, 1]), 2.5):.2f} and "
+      f"{np.percentile(np.exp(prior_draws[:, 1]), 97.5):.1f}")
+
+# %% [markdown]
+The prior says that any learning rate is plausible, with slightly less weight on the extremes, and that $\beta$ is probably somewhere between 0.4 and 20 — $\beta = 400$ is ruled out, $\beta = 50$ is merely unlikely. That is a *weakly informative* prior: it encodes the scale of the problem without pretending to know the answer. (Which priors are appropriate is a modelling decision; state it and test it with simulations, as in lesson 6.)
+
+### ✏️ Exercise 8.2 — The log posterior of the RW model *(coding)*
+
+Write the log posterior (up to a constant) of the unconstrained parameters `x = (logit alpha, log beta)` given a participant's `choices` and `rewards`, with independent Normal priors `N(mu[i], sd[i])` on the two components of `x`. Use `fitting.to_constrained(x, ["unit", "pos"])` to recover $(\alpha, \beta)$, `models.nll_rw` for the likelihood and `scipy.stats.norm.logpdf` for the prior.
+
+# %% [exercise 8.2]
+def log_posterior_rw(x, choices, rewards, mu, sd):
+    """Log posterior (up to a constant) of x = (logit alpha, log beta) under Normal priors in the unconstrained space."""
+    from scipy import stats
+    theta = ...                   # <- (alpha, beta) from x: fitting.to_constrained(x, ["unit", "pos"])
+    log_likelihood = ...          # <- the log-likelihood of the choices (careful with the sign of nll_rw)
+    log_prior = ...               # <- sum over the two parameters of stats.norm.logpdf(x, mu, sd)
+    return log_likelihood + log_prior
+
+check("8.2", log_posterior_rw)
+
+# %% [markdown]
+Let's look at the likelihood and the posterior of our extreme participant side by side, on a grid in the unconstrained space. The prior does not move the maximum much in the $\alpha$ direction, but it closes off the runaway direction in $\beta$.
+
+# %%
+log_posterior_rw = use("8.2", log_posterior_rw)
+
+xa = np.linspace(-4, 4, 61)                   # logit alpha
+xb = np.linspace(-2, 6, 61)                   # log beta
+LL = np.zeros((len(xb), len(xa)))             # log-likelihood
+LP = np.zeros_like(LL)                        # log posterior
+with np.errstate(divide="ignore"):
+    for i, b in enumerate(xb):
+        for j, a in enumerate(xa):
+            LL[i, j] = -models.nll_rw(fitting.to_constrained([a, b], ["unit", "pos"]), d["choices"], d["rewards"])
+            LP[i, j] = log_posterior_rw(np.array([a, b]), d["choices"], d["rewards"], mu_prior, sd_prior)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+for ax, Z, title in zip(axes, [LL, LP], ["log-likelihood", "log posterior (likelihood × prior)"]):
+    ax.contourf(xa, xb, Z - Z.max(), levels=np.linspace(-12, 0, 13), cmap=plotting.SEQUENTIAL)
+    ax.contour(xa, xb, Z - Z.max(), levels=[-2], colors="white", linewidths=1)
+    ax.plot(models.logit(true_alpha), np.log(true_beta), "*", color=plotting.PALETTE[7], ms=12, label="true parameters")
+    ax.set(xlabel="logit(α)", title=title)
+axes[0].set_ylabel("log(β)")
+axes[0].legend(loc="lower left")
+plt.show()
+
+# %% [markdown]
+The white contour encloses the region within 2 log-units of the maximum. In the likelihood panel that region is open at the top: any large $\beta$ is almost as good as any other. In the posterior panel the prior closes it. The point of highest posterior density is the **maximum a posteriori** (MAP) estimate,
+
+$$
+\hat{x}_{\text{MAP}} = \arg\max_x \big[\log p(D \mid x) + \log p(x)\big],
+$$
+
+which we can find with the same optimiser as before — `fitting.fit_mle` accepts a `log_prior` function and then minimises the negative log *posterior*. Here are MAP estimates for all 60 participants, compared with the MLEs:
+
+# %%
+log_prior = fitting.normal_log_prior(mu_prior, sd_prior)       # a function x -> log N(x | mu, sd), summed over parameters
+with np.errstate(over="ignore"):
+    map_est = np.array([fitting.fit_mle(models.nll_rw, (d_["choices"], d_["rewards"]), ["unit", "pos"], n_starts=3, rng=rng,
+                                        log_prior=log_prior)["params"] for d_ in small_data])
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
+axes[0].scatter(mle[:, 0], map_est[:, 0], s=22, alpha=0.8, edgecolor="white")
+axes[0].plot([0, 1], [0, 1], ls="--", color="#52514e", lw=1)
+axes[0].axhline(true_alpha, color=plotting.PALETTE[7], ls=":", lw=1); axes[0].axvline(true_alpha, color=plotting.PALETTE[7], ls=":", lw=1)
+axes[0].set(xlabel="MLE of α", ylabel="MAP of α", title="Learning rate: little change")
+axes[1].scatter(mle[:, 1], map_est[:, 1], s=22, alpha=0.8, edgecolor="white")
+axes[1].plot([0.1, 1000], [0.1, 1000], ls="--", color="#52514e", lw=1)
+axes[1].axhline(true_beta, color=plotting.PALETTE[7], ls=":", lw=1); axes[1].axvline(true_beta, color=plotting.PALETTE[7], ls=":", lw=1)
+axes[1].set(xscale="log", yscale="log", xlabel="MLE of β", ylabel="MAP of β", title="Inverse temperature: extreme values are pulled back")
+plt.show()
+print(f"MLE beta: median {np.median(mle[:, 1]):.1f}, max {mle[:, 1].max():.0f}   |   MAP beta: median {np.median(map_est[:, 1]):.1f}, max {map_est[:, 1].max():.1f}")
+
+# %% [markdown]
+The MAP estimates of $\beta$ stay within the plausible range: the prior *shrinks* extreme estimates towards values it considers likely while leaving well-determined estimates almost untouched. This is the simplest form of **regularisation**, and it is why almost every published fit of a trial-by-trial model uses MAP rather than plain maximum likelihood (Daw 2011).
+
+## 8.3 How uncertain is the estimate? The Laplace approximation
+
+A posterior is a whole distribution; a cheap way to summarise its width is to approximate it by a Gaussian centred on the MAP estimate. The curvature of the negative log posterior at its minimum tells us how peaked the posterior is:
+
+$$
+p(x \mid D) \approx \mathcal{N}\!\big(\hat{x}_{\text{MAP}},\ \Sigma\big), \qquad \Sigma = H^{-1}, \qquad H = -\nabla^2 \log p(x \mid D)\big|_{\hat{x}_{\text{MAP}}} .
+$$
+
+$H$ is the **Hessian** (matrix of second derivatives). A large second derivative means the log posterior falls off steeply around the maximum — a narrow posterior — so the variance is its *inverse*. `fitting.laplace_covariance` computes $H$ by finite differences and inverts it.
+
+# %%
+def neg_log_post(x, d_=d):
+    return -log_posterior_rw(x, d_["choices"], d_["rewards"], mu_prior, sd_prior)
+
+fit_d = fitting.fit_mle(models.nll_rw, (d["choices"], d["rewards"]), ["unit", "pos"], n_starts=3, rng=rng, log_prior=log_prior)
+x_map = fit_d["x"]
+cov = fitting.laplace_covariance(neg_log_post, x_map)
+sd_laplace = np.sqrt(np.diag(cov))
+lo, hi = x_map - 1.96 * sd_laplace, x_map + 1.96 * sd_laplace
+
+print(f"MAP (unconstrained): logit alpha = {x_map[0]:.2f} ± {sd_laplace[0]:.2f},  log beta = {x_map[1]:.2f} ± {sd_laplace[1]:.2f}")
+print(f"95% interval for alpha: {models.sigmoid(lo[0]):.2f} – {models.sigmoid(hi[0]):.2f}   (MAP {models.sigmoid(x_map[0]):.2f}, true {true_alpha})")
+print(f"95% interval for beta : {np.exp(lo[1]):.1f} – {np.exp(hi[1]):.1f}   (MAP {np.exp(x_map[1]):.1f}, true {true_beta})")
+
+# compare the Gaussian approximation with the exact posterior along the logit-alpha axis (log beta fixed at its MAP value)
+grid = np.linspace(x_map[0] - 4 * sd_laplace[0], x_map[0] + 4 * sd_laplace[0], 200)
+exact = np.array([-neg_log_post(np.array([g, x_map[1]])) for g in grid])
+exact = np.exp(exact - exact.max()); exact /= exact.sum() * (grid[1] - grid[0])      # normalise to a density
+gauss = np.exp(-0.5 * ((grid - x_map[0]) / sd_laplace[0]) ** 2) / (sd_laplace[0] * np.sqrt(2 * np.pi))
+fig, ax = plt.subplots(figsize=(6.5, 3.4))
+ax.plot(grid, exact, label="exact (conditional) posterior")
+ax.plot(grid, gauss, ls="--", label="Laplace approximation")
+ax.set(xlabel="logit(α)", ylabel="density", title="The Laplace approximation of one participant's posterior")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+With 30 trials the 95% interval for $\beta$ is wide — an honest statement that the data barely constrain it. Note that intervals are formed in the unconstrained space and then transformed; the resulting interval for $\alpha$ is asymmetric, as a posterior on a bounded parameter should be. The Laplace approximation is also the ingredient that the hierarchical EM algorithm of section 8.5 uses for each participant.
+
+### ✏️ Exercise 8.3 — A posterior standard deviation from the Hessian *(maths)*
+
+For a model with a single parameter, the second derivative of the negative log posterior at its minimum is $H = 25$. What is the posterior standard deviation under the Laplace approximation?
+
+# %% [exercise 8.3]
+answer = None   # <- your number
+check("8.3", answer)
+
+# %% [markdown]
+### ✏️ Exercise 8.4 — Transforming a credible interval *(maths)*
+
+A participant's MAP estimate of $\operatorname{logit}(\alpha)$ is $0.5$ with a Laplace standard deviation of $0.4$. What is the **upper** end of the 95% interval for $\alpha$ itself? (Use $\pm 1.96$ standard deviations and give three decimals.)
+
+# %% [exercise 8.4]
+answer = None   # <- your number
+check("8.4", answer)
+
+# %% [markdown]
+## 8.4 Sampling the posterior: Markov chain Monte Carlo
+
+The Laplace approximation assumes the posterior is Gaussian in the unconstrained space; the figure above shows that it is close but not exact, and for complicated models it can be badly off. **Markov chain Monte Carlo** (MCMC) makes no such assumption: it produces *samples* from the posterior, and any question — mean, interval, probability that $\alpha > 0.5$, correlation between parameters — becomes a matter of counting samples.
+
+The simplest MCMC algorithm is **random-walk Metropolis–Hastings** (Metropolis et al. 1953; Hastings 1970). Starting from some point $x$:
+
+1. **Propose** a nearby point, $x' = x + \varepsilon$ with $\varepsilon \sim \mathcal{N}(0, s^2 I)$ ($s$ is the proposal scale).
+2. **Accept** the proposal with probability $\min\!\big(1,\ p(x' \mid D) / p(x \mid D)\big)$; in logs: draw $u \sim \text{Uniform}(0, 1)$ and accept if $\log u < \log p(x' \mid D) - \log p(x \mid D)$.
+3. If accepted, move to $x'$; otherwise **stay** at $x$. Either way, record the current position as a sample.
+
+Only the *ratio* of posterior densities enters, so the normalising constant $p(D)$ — the hard part of Bayes' rule — is never needed. The sequence of recorded positions is a Markov chain whose long-run distribution is the posterior.
+
+### ✏️ Exercise 8.5 — A Metropolis–Hastings sampler *(coding)*
+
+Implement the sampler. `log_target(x)` returns the unnormalised log posterior at a vector `x`; `x0` is the starting point; return `(samples, acceptance_rate)` with `samples` an array of shape `(n_samples, dim)` and the acceptance rate the fraction of accepted proposals. The checker runs your sampler on a two-dimensional Gaussian with a known mean and spread and checks the statistics of the samples (so it does not matter exactly how you draw random numbers, as long as you use `rng`).
+
+# %% [exercise 8.5]
+def metropolis_hastings(log_target, x0, n_samples, proposal_sd, rng):
+    """Random-walk Metropolis–Hastings. Returns (samples, acceptance_rate)."""
+    x = np.atleast_1d(np.asarray(x0, float))
+    log_p = log_target(x)             # log density of the current position
+    samples = []
+    n_accepted = 0
+    for _ in range(n_samples):
+        raise NotImplementedError("your code here: propose, evaluate, accept or reject, record the current position")
+    return np.array(samples), n_accepted / n_samples
+
+check("8.5", metropolis_hastings)
+
+# %% [markdown]
+First a sanity check on a target whose answer we know: a two-dimensional Gaussian with mean $(1, -1)$ and standard deviations $(1, 0.5)$.
+
+# %%
+metropolis_hastings = use("8.5", metropolis_hastings)
+
+def log_gauss(x):
+    return -0.5 * np.sum(((x - np.array([1.0, -1.0])) / np.array([1.0, 0.5])) ** 2)
+
+samples_g, acc_g = metropolis_hastings(log_gauss, np.zeros(2), n_samples=4000, proposal_sd=1.0, rng=rng)
+print(f"acceptance rate {acc_g:.2f};  sample mean {samples_g.mean(0).round(2)} (true [1, -1]);  sample sd {samples_g.std(0).round(2)} (true [1, 0.5])")
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), width_ratios=[2, 1])
+axes[0].plot(samples_g[:600, 0], lw=1, label="x₁")
+axes[0].plot(samples_g[:600, 1], lw=1, label="x₂")
+axes[0].set(xlabel="iteration", ylabel="value", title="Trace plot: the first 600 samples")
+axes[0].legend()
+axes[1].scatter(samples_g[:, 0], samples_g[:, 1], s=4, alpha=0.3)
+axes[1].set(xlabel="x₁", ylabel="x₂", title="All samples")
+plt.show()
+
+# %% [markdown]
+The chain wanders through the target in proportion to its density. Now the real thing: the posterior over $(\alpha, \beta)$ of a participant with 150 trials. We sample in the unconstrained space (where the proposal is a simple Gaussian step), discard the first 500 samples as **burn-in** (the chain has to find the region of high density first), and transform the remaining samples to the $\alpha$ and $\beta$ scales.
+
+# %%
+d150 = models.simulate_rw_bandit([0.7, 0.3], true_alpha, true_beta, 150, rng)
+
+def log_post_150(x):
+    return log_posterior_rw(x, d150["choices"], d150["rewards"], mu_prior, sd_prior)
+
+with np.errstate(divide="ignore"):                   # a wild proposal can make a choice probability underflow to 0: log(0) = -inf, and the proposal is simply rejected
+    samples_x, acc = metropolis_hastings(log_post_150, np.zeros(2), n_samples=4000, proposal_sd=0.3, rng=rng)
+post_x = samples_x[500:]                              # drop the burn-in
+alpha_samples, beta_samples = models.sigmoid(post_x[:, 0]), np.exp(post_x[:, 1])
+
+fit150_mle = fitting.fit_mle(models.nll_rw, (d150["choices"], d150["rewards"]), ["unit", "pos"], n_starts=3, rng=rng)["params"]
+fit150_map = fitting.fit_mle(models.nll_rw, (d150["choices"], d150["rewards"]), ["unit", "pos"], n_starts=3, rng=rng, log_prior=log_prior)["params"]
+print(f"acceptance rate {acc:.2f}")
+print(f"alpha: true {true_alpha}  MLE {fit150_mle[0]:.2f}  MAP {fit150_map[0]:.2f}  posterior mean {alpha_samples.mean():.2f}  "
+      f"95% interval {np.percentile(alpha_samples, 2.5):.2f}–{np.percentile(alpha_samples, 97.5):.2f}")
+print(f"beta : true {true_beta}  MLE {fit150_mle[1]:.2f}  MAP {fit150_map[1]:.2f}  posterior mean {beta_samples.mean():.2f}  "
+      f"95% interval {np.percentile(beta_samples, 2.5):.2f}–{np.percentile(beta_samples, 97.5):.2f}")
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+axes[0].plot(samples_x[:, 0], lw=0.8, label="logit(α)")
+axes[0].plot(samples_x[:, 1], lw=0.8, label="log(β)")
+axes[0].axvspan(0, 500, color="#52514e", alpha=0.15, label="burn-in")
+axes[0].set(xlabel="iteration", ylabel="value", title="Trace plot of the chain (unconstrained space)")
+axes[0].legend(loc="upper right", fontsize=8)
+axes[1].scatter(alpha_samples, beta_samples, s=4, alpha=0.3)
+axes[1].plot(true_alpha, true_beta, "*", color=plotting.PALETTE[7], ms=12, label="true")
+axes[1].set(xlabel="α", ylabel="β", title=f"Joint posterior (r = {np.corrcoef(alpha_samples, beta_samples)[0, 1]:.2f})")
+axes[1].legend()
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+plotting.plot_posterior_1d(alpha_samples, true=true_alpha, ax=axes[0], name="α")
+plotting.plot_posterior_1d(beta_samples, true=true_beta, ax=axes[1], name="β")
+axes[0].set_title("Posterior of α"); axes[1].set_title("Posterior of β")
+plt.show()
+
+# %% [markdown]
+The posterior tells us far more than a point estimate: how wide the plausible range is, that it is skewed for $\beta$, and that the two parameters are negatively correlated — a high $\alpha$ with a low $\beta$ explains the data about as well as the reverse, the identifiability issue of lesson 6 made visible.
+
+### Tuning the proposal
+
+The proposal scale $s$ is the one knob of the sampler, and it matters. Here is the same chain with three different scales:
+
+# %%
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.2), sharey=True)
+for ax, s in zip(axes, [0.02, 0.3, 5.0]):
+    with np.errstate(divide="ignore"):
+        smp, a_rate = metropolis_hastings(log_post_150, np.zeros(2), n_samples=1500, proposal_sd=s, rng=rng)
+    ax.plot(smp[:, 1], lw=0.8)
+    ax.set(xlabel="iteration", title=f"proposal sd = {s}: acceptance {a_rate:.0%}")
+axes[0].set_ylabel("log(β)")
+plt.show()
+
+# %% [markdown]
+### ✏️ Exercise 8.6 — Reading the acceptance rate *(conceptual)*
+
+Your Metropolis–Hastings chain accepts 98% of its proposals. What does this tell you?
+
+**(a)** The sampler has converged perfectly; the posterior is well characterised.
+**(b)** The proposals are too small: the chain creeps along, consecutive samples are highly correlated and the posterior is explored very slowly.
+**(c)** The proposals are too large: most moves jump into the tails and are wasted.
+**(d)** The posterior must be flat (uniform).
+
+# %% [exercise 8.6]
+check("8.6", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+Practical rules: aim for an acceptance rate of roughly 20–50%, discard the burn-in, run more than one chain from different starting points and check that they agree (section 8.6 quantifies this with $\hat{R}$), and remember that consecutive samples are correlated, so 3500 samples are worth fewer than 3500 independent draws (the *effective sample size*). Modern samplers such as the No-U-Turn Sampler used by Stan and PyMC are much more efficient than our random walk, but they rest on the same logic.
+
+## 8.5 Hierarchical models: letting participants inform each other
+
+So far every participant was fitted on their own, with a prior we chose by hand. But participants come from a population, and the population tells us what to expect of each of them. A **hierarchical** (multilevel) model makes this explicit by adding one more level to the generative story:
+
+$$
+x_i \sim \mathcal{N}(\mu, \tau^2) \quad \text{for each participant } i \text{ (separately for each parameter)}, \qquad
+D_i \sim p(D_i \mid x_i).
+$$
+
+The group mean $\mu$ and spread $\tau$ are now *estimated from the data* instead of guessed. Two things follow. The individual estimates are regularised by a prior that is as wide or narrow as the population really is (**partial pooling**), and participants with little or noisy data are pulled towards the group mean — **shrinkage** — while participants with clean data are left alone. The amount of shrinkage is governed by the ratio of the group variance to the participant's own uncertainty (Exercise 8.8).
+
+### Empirical Bayes by expectation–maximisation
+
+Huys et al. (2011) popularised a fast approximation that is still widely used (see also Gershman 2016). It alternates two steps until the group parameters stop changing:
+
+- **E-step.** For every participant, find the MAP estimate $\hat{x}_i$ under the *current* group prior $\mathcal{N}(\mu, \tau^2)$, and its Laplace variance $\hat{v}_i$ (section 8.3).
+- **M-step.** Update the group distribution from the participants' posteriors:
+
+$$
+\mu \leftarrow \frac{1}{N}\sum_i \hat{x}_i, \qquad
+\tau^2 \leftarrow \frac{1}{N}\sum_i \big(\hat{x}_i^2 + \hat{v}_i\big) - \mu^2 .
+$$
+
+The term $\hat{v}_i$ is what makes this *Bayesian*: a participant whose parameter is poorly determined contributes uncertainty, not a false sense of precision, to the group variance.
+
+### ✏️ Exercise 8.7 — The M-step of hierarchical EM *(coding)*
+
+Implement the M-step. `x_hat` and `var_hat` are arrays of shape `(n_subjects, n_params)`: the MAP estimates and Laplace variances of every participant. Return the group mean and standard deviation (one value per parameter).
+
+# %% [exercise 8.7]
+def em_m_step(x_hat, var_hat):
+    """Group mean and sd (unconstrained space) from per-subject MAP estimates and Laplace variances."""
+    x_hat = np.asarray(x_hat, float)
+    var_hat = np.asarray(var_hat, float)
+    mu = ...                       # <- the group mean of the estimates (one value per parameter)
+    second_moment = ...            # <- mean of x_hat**2 + var_hat (one value per parameter)
+    sd = ...                       # <- sqrt(second_moment - mu**2)
+    return mu, sd
+
+check("8.7", em_m_step)
+
+# %% [markdown]
+`fitting.em_hierarchical` runs the full algorithm (its M-step is exactly your function). We simulate a group of 25 participants whose parameters are drawn from a population — $\operatorname{logit}(\alpha) \sim \mathcal{N}(-0.8, 0.7^2)$, $\log\beta \sim \mathcal{N}(1.4, 0.4^2)$ — with 100 trials each, and compare the individual estimates obtained by maximum likelihood with those obtained by hierarchical EM.
+
+# %%
+em_m_step = use("8.7", em_m_step)
+
+n_group, n_trials_group = 25, 100
+true_mu, true_tau = np.array([-0.8, 1.4]), np.array([0.7, 0.4])
+true_x = rng.normal(true_mu, true_tau, size=(n_group, 2))
+true_params = np.array([fitting.to_constrained(x, ["unit", "pos"]) for x in true_x])
+group_data = [models.simulate_rw_bandit([0.7, 0.3], a, b, n_trials_group, rng) for a, b in true_params]
+data_list = [(g["choices"], g["rewards"]) for g in group_data]
+
+with np.errstate(over="ignore"):
+    mle_group = np.array([fitting.fit_mle(models.nll_rw, dd, ["unit", "pos"], n_starts=3, rng=rng)["params"] for dd in data_list])
+    em = fitting.em_hierarchical(models.nll_rw, data_list, ["unit", "pos"], n_iter=8, n_starts=2, rng=rng, verbose=True)
+
+print(f"\npopulation mean {true_mu}; realised mean of these {n_group} participants {true_x.mean(0).round(2)}; EM estimate {em['mu'].round(2)}")
+print(f"population sd   {true_tau}; realised sd of these {n_group} participants   {true_x.std(0).round(2)}; EM estimate {em['sd'].round(2)}")
+print("check: one more M-step with your function reproduces the final group parameters:",
+      np.allclose(em_m_step(em["x"], em["var"])[0], em["mu"]))
+
+# %%
+fig, axes = plt.subplots(2, 2, figsize=(9, 7.5))
+plotting.plot_parameter_recovery(true_params, mle_group, ["α", "β"], axes=axes[0])
+plotting.plot_parameter_recovery(true_params, em["params"], ["α", "β"], axes=axes[1])
+axes[0, 0].set_title("MLE: " + axes[0, 0].get_title()); axes[0, 1].set_title("MLE: " + axes[0, 1].get_title())
+axes[1, 0].set_title("hierarchical EM: " + axes[1, 0].get_title()); axes[1, 1].set_title("hierarchical EM: " + axes[1, 1].get_title())
+axes[0, 1].set_yscale("log"); axes[1, 1].set_yscale("log")
+plt.tight_layout()
+plt.show()
+
+# %%
+# shrinkage: where each participant's beta estimate moves when the group prior is taken into account
+order = np.argsort(true_params[:, 1])
+fig, ax = plt.subplots(figsize=(8, 3.8))
+for rank, i in enumerate(order):
+    ax.annotate("", xy=(rank, em["params"][i, 1]), xytext=(rank, mle_group[i, 1]),
+                arrowprops=dict(arrowstyle="->", color="#52514e", lw=0.8))
+ax.scatter(range(n_group), mle_group[order, 1], s=20, label="MLE", color=plotting.PALETTE[0])
+ax.scatter(range(n_group), em["params"][order, 1], s=20, label="hierarchical EM", color=plotting.PALETTE[1])
+ax.scatter(range(n_group), true_params[order, 1], s=40, marker="*", label="true", color=plotting.PALETTE[7])
+ax.axhline(np.exp(em["mu"][1]), color=plotting.PALETTE[1], ls=":", lw=1, label="group mean (EM)")
+ax.set(yscale="log", xlabel="participants (sorted by true β)", ylabel="β (log scale)", title="Shrinkage pulls noisy estimates towards the group")
+ax.legend(fontsize=8, ncol=2)
+plt.show()
+
+# %% [markdown]
+Shrinkage improves recovery where it matters: the extreme MLEs (arrows at the top) are pulled back towards the population, while well-determined estimates barely move. The price is a small bias towards the group mean for everyone — a bias that is worth paying when individual estimates are noisy, but that must be kept in mind when the research question is about *differences* between people (Exercise 8.10, and lesson 14).
+
+Notice also that the estimated group spread of $\log\beta$ is smaller than the realised spread printed above. With 100 trials per participant the data cannot fully separate true variability between people from estimation noise within each person, and the hierarchical model is conservative: it attributes what it cannot pin down to noise. More trials per participant (or more participants) narrow this gap — another reason to run the recovery checks of lesson 6 on the *hierarchical* model before interpreting group variances.
+
+### ✏️ Exercise 8.8 — How much shrinkage? *(maths)*
+
+A participant's own data give a (Laplace) likelihood for $\operatorname{logit}(\alpha)$ centred on $\hat{x} = 2$ with variance $\sigma^2 = 3$; the group prior is $\mathcal{N}(\mu, \tau^2)$ with $\tau^2 = 1$. The posterior mean is a weighted average $w\,\hat{x} + (1 - w)\,\mu$. What is the weight $w$ on the participant's own estimate?
+
+# %% [exercise 8.8]
+answer = None   # <- your number
+check("8.8", answer)
+
+# %% [markdown]
+## 8.6 The full hierarchical model in PyMC *(optional)*
+
+The EM algorithm approximates each participant's posterior by a Gaussian and the group by a point estimate. A **probabilistic programming language** lets you write down the full generative model and sample the joint posterior of *all* parameters — individual and group-level — with an efficient MCMC algorithm. We use PyMC (Stan is the other common choice); the likelihood code follows the PyMC example by Vieira (2022).
+
+Two technical notes. Trial-by-trial models have a loop over trials, which PyMC expresses with `pytensor.scan`. And we write the individual parameters in the **non-centred** form $x_i = \mu + \tau z_i$ with $z_i \sim \mathcal{N}(0, 1)$, which samples much better than $x_i \sim \mathcal{N}(\mu, \tau^2)$ when $\tau$ is small.
+
+This section is optional: if PyMC is not installed it is skipped, and nothing later depends on it. (The environment variable set in the first line avoids a dependency on a C compiler; it is harmless if one is available.)
+
+# %%
+import os, time, warnings
+os.environ.setdefault("PYTENSOR_FLAGS", "cxx=")       # must be set *before* pymc is imported
+warnings.filterwarnings("ignore", message="IProgress not found")   # two cosmetic warnings (progress bars, a JAX dtype cast)
+warnings.filterwarnings("ignore", message="scatter inputs have incompatible types")
+HAVE_PYMC = False
+try:
+    import pymc as pm, pytensor, pytensor.tensor as pt, arviz as az
+    HAVE_PYMC = True
+    print("PyMC", pm.__version__, "— the optional section will run")
+except ImportError:
+    print("PyMC is not installed: this optional section is skipped. To run it: pip install pymc arviz numpyro")
+
+# %%
+if HAVE_PYMC:
+    n_s = 12                                                          # a subset of the simulated group, to keep it quick
+    A = np.array([group_data[i]["choices"] for i in range(n_s)]).T.astype("int64")   # (n_trials, n_s)
+    R = np.array([group_data[i]["rewards"] for i in range(n_s)]).T                   # (n_trials, n_s)
+
+    def update_Q(a_t, r_t, Qs, alpha):
+        """One trial for all participants at once: a_t, r_t are vectors over participants, Qs is (n_s, 2)."""
+        idx = pt.arange(a_t.shape[0])
+        q_chosen = Qs[idx, a_t]
+        return pt.set_subtensor(Qs[idx, a_t], q_chosen + alpha * (r_t - q_chosen))
+
+    def values_before_choice(a_, r_, alpha):
+        kwargs = dict(fn=update_Q, sequences=[a_, r_], outputs_info=[pt.full((n_s, 2), 0.5)], non_sequences=[alpha])
+        try:
+            Qs = pytensor.scan(return_updates=False, **kwargs)
+        except TypeError:                                             # older pytensor versions
+            Qs, _ = pytensor.scan(**kwargs)
+        return pt.concatenate([pt.full((1, n_s, 2), 0.5), Qs[:-1]], axis=0)   # shift: values *before* each choice
+
+    with pm.Model() as hierarchical_rw:
+        # group level (unconstrained space), same weakly informative scale as before
+        mu_a = pm.Normal("mu_logit_alpha", 0.0, 1.5)
+        tau_a = pm.HalfNormal("tau_logit_alpha", 1.0)
+        mu_b = pm.Normal("mu_log_beta", 1.0, 1.0)
+        tau_b = pm.HalfNormal("tau_log_beta", 1.0)
+        # individual level, non-centred
+        z_a = pm.Normal("z_alpha", 0.0, 1.0, shape=n_s)
+        z_b = pm.Normal("z_beta", 0.0, 1.0, shape=n_s)
+        alpha = pm.Deterministic("alpha", pm.math.sigmoid(mu_a + tau_a * z_a))
+        beta = pm.Deterministic("beta", pm.math.exp(mu_b + tau_b * z_b))
+        # likelihood: replay the RW model on every participant's choices
+        a_ = pt.as_tensor_variable(A)
+        r_ = pt.as_tensor_variable(R)
+        Qs = values_before_choice(a_, r_, alpha)                      # (n_trials, n_s, 2)
+        log_probs = pm.math.log_softmax(beta[None, :, None] * Qs, axis=2)
+        log_lik = log_probs[pt.arange(A.shape[0])[:, None], pt.arange(n_s)[None, :], a_].sum()
+        pm.Potential("log_likelihood", log_lik)
+
+        t0 = time.time()
+        try:
+            idata = pm.sample(draws=800, tune=800, chains=2, random_seed=2024, progressbar=False, nuts_sampler="numpyro")
+        except Exception as exc:                                      # numpyro/jax not available: use PyMC's own sampler
+            print(f"numpyro sampler unavailable ({type(exc).__name__}); using the default sampler (slower)")
+            idata = pm.sample(draws=800, tune=800, chains=2, random_seed=2024, progressbar=False)
+    print(f"sampling took {time.time() - t0:.0f} s")
+
+# %%
+if HAVE_PYMC:
+    summary = az.summary(idata, var_names=["mu_logit_alpha", "tau_logit_alpha", "mu_log_beta", "tau_log_beta"])
+    print(summary[[c for c in summary.columns if c in ("mean", "sd", "ess_bulk", "r_hat")]])
+    print(f"\nfor comparison — realised group mean {true_x[:n_s].mean(0).round(2)}, sd {true_x[:n_s].std(0).round(2)} of these {n_s} participants;  "
+          f"EM estimate (all {n_group}): mean {em['mu'].round(2)}, sd {em['sd'].round(2)}")
+
+    post_alpha = idata.posterior["alpha"].mean(("chain", "draw")).values
+    post_beta = idata.posterior["beta"].mean(("chain", "draw")).values
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+    plotting.plot_parameter_recovery(true_params[:n_s], np.column_stack([post_alpha, post_beta]), ["α", "β"], axes=axes)
+    axes[0].set_title("PyMC posterior mean: " + axes[0].get_title()); axes[1].set_title("PyMC posterior mean: " + axes[1].get_title())
+    plt.show()
+
+# %% [markdown]
+`ess_bulk` is the effective sample size and `r_hat` the Gelman–Rubin statistic $\hat{R}$, which compares the spread *between* chains with the spread *within* chains: values near 1.00 mean the chains agree. With only two short chains you may see values slightly above 1.01 here; in real work use 4 chains and at least 1000 draws each, and treat $\hat{R} > 1.01$ as a warning (Vehtari et al. 2021).
+
+### ✏️ Exercise 8.9 — Reading an MCMC diagnostic *(conceptual)*
+
+After sampling a hierarchical model, ArviZ reports $\hat{R} = 1.5$ for the group mean of $\beta$. What does this mean?
+
+**(a)** The posterior standard deviation of that parameter is 1.5.
+**(b)** The chains disagree with each other: they have not converged (mixed), so the samples cannot be trusted yet.
+**(c)** Sampling was 1.5 times faster than expected.
+**(d)** The prior on $\beta$ was too wide.
+
+# %% [exercise 8.9]
+check("8.9", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 8.7 Tools used in the field, and when to use what
+
+- **MAP with hand-chosen priors** (section 8.2) is the minimum you should do for any trial-by-trial model; it is fast and prevents absurd estimates.
+- **Empirical-Bayes EM** (section 8.5; Huys et al. 2011; Gershman 2016) is the workhorse of many labs for hierarchical fitting of RL models and is what `fitting.em_hierarchical` implements.
+- **Hierarchical Bayesian Inference (HBI)** by Piray et al. (2019) extends EM to fit *several models at once* and to estimate, hierarchically, which model each participant uses — combining this lesson with the model comparison of lesson 7. It is available as the `cbm` toolbox (MATLAB).
+- **hBayesDM** (Ahn, Haines & Zhang 2017) provides ready-made hierarchical Stan models for many tasks (R and Python).
+- **Stan / PyMC** (section 8.6) when you need the full posterior, custom models, or covariates inside the hierarchy (lesson 14).
+
+Whatever the tool, the checks of lesson 6 still apply: simulate from the hierarchical model, refit, and verify that both the individual and the group parameters are recovered.
+
+### ✏️ Exercise 8.10 — When does hierarchical fitting help, and when can it mislead? *(conceptual, written)*
+
+In 3–5 sentences: when does a hierarchical (group-level) model improve parameter estimates, and in what situation can it produce a misleading result? Write your answer in the string below.
+
+# %% [exercise 8.10]
+check("8.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- Maximum likelihood gives no uncertainty and no regularisation; with few trials it produces extreme estimates because the likelihood has no interior maximum.
+- The **log posterior** is the log-likelihood plus the log prior; priors are placed on the unconstrained parameters, and the **MAP** estimate is found with the same optimiser as the MLE.
+- The **Laplace approximation** summarises the posterior by a Gaussian whose covariance is the inverse Hessian of the negative log posterior; intervals are built in the unconstrained space and then transformed.
+- **Metropolis–Hastings** samples any posterior from its unnormalised log density: propose, accept with the density ratio, otherwise stay. Tune the proposal for 20–50% acceptance, discard the burn-in, check mixing.
+- **Hierarchical models** estimate the group distribution from the data and shrink noisy individual estimates towards it; the **EM** algorithm (E: MAP + Laplace per subject; M: group mean and variance including the subjects' uncertainties) is a fast approximation, and PyMC/Stan give the full posterior.
+- Shrinkage is a feature for noisy data and a hazard for group comparisons unless the group structure is part of the model.
+
+## What's next
+
+Lesson 9 leaves the bandit for the **two-step task** and the **model-based / model-free hybrid** of Daw et al. (2011) — a seven-parameter model for which everything in lessons 5–8 (MAP fitting, recovery, comparison, hierarchical estimation) is essential.
+
+## References
+
+- Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A., & Rubin, D. B. (2013). *Bayesian Data Analysis* (3rd ed.). CRC Press.
+- Lee, M. D., & Wagenmakers, E.-J. (2013). *Bayesian Cognitive Modeling: A Practical Course*. Cambridge University Press.
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press.
+- Metropolis, N., Rosenbluth, A. W., Rosenbluth, M. N., Teller, A. H., & Teller, E. (1953). Equation of state calculations by fast computing machines. *Journal of Chemical Physics, 21*(6), 1087–1092. https://doi.org/10.1063/1.1699114
+- Hastings, W. K. (1970). Monte Carlo sampling methods using Markov chains and their applications. *Biometrika, 57*(1), 97–109. https://doi.org/10.1093/biomet/57.1.97
+- Gelman, A., & Rubin, D. B. (1992). Inference from iterative simulation using multiple sequences. *Statistical Science, 7*(4), 457–472. https://doi.org/10.1214/ss/1177011136
+- Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C. (2021). Rank-normalization, folding, and localization: An improved R̂ for assessing convergence of MCMC. *Bayesian Analysis, 16*(2), 667–718. https://doi.org/10.1214/20-BA1221
+- Dempster, A. P., Laird, N. M., & Rubin, D. B. (1977). Maximum likelihood from incomplete data via the EM algorithm. *Journal of the Royal Statistical Society: Series B, 39*(1), 1–38. https://doi.org/10.1111/j.2517-6161.1977.tb01600.x
+- Huys, Q. J. M., Cools, R., Gölzer, M., Friedel, E., Heinz, A., Dolan, R. J., & Dayan, P. (2011). Disentangling the roles of approach, activation and valence in instrumental and Pavlovian responding. *PLoS Computational Biology, 7*(4), e1002028. https://doi.org/10.1371/journal.pcbi.1002028
+- Gershman, S. J. (2016). Empirical priors for reinforcement learning models. *Journal of Mathematical Psychology, 71*, 1–6. https://doi.org/10.1016/j.jmp.2016.01.006
+- Piray, P., Dezfouli, A., Heskes, T., Frank, M. J., & Daw, N. D. (2019). Hierarchical Bayesian inference for concurrent model fitting and comparison for group studies. *PLoS Computational Biology, 15*(6), e1007043. https://doi.org/10.1371/journal.pcbi.1007043
+- Ahn, W.-Y., Haines, N., & Zhang, L. (2017). Revealing neurocomputational mechanisms of reinforcement learning and decision-making with the hBayesDM package. *Computational Psychiatry, 1*, 24–57. https://doi.org/10.1162/CPSY_a_00002
+- Vieira, R. (2022). *Fitting a reinforcement learning model to behavioral data with PyMC* (PyMC example gallery, MIT licence). https://www.pymc.io/projects/examples/en/latest/case_studies/reinforcement_learning.html
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547

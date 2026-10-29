@@ -1,0 +1,380 @@
+# %% [markdown]
+# Lesson 5 — Fitting models to behaviour: maximum likelihood
+
+Lessons 3 and 4 went from parameters to behaviour: give the model a learning rate and an inverse temperature and it produces choices. Science mostly needs the opposite direction. A participant made 200 choices — which learning rate and inverse temperature best explain them? Does one group learn faster from losses than another? Answering such questions means **fitting** the model to data, and the workhorse for that is **maximum likelihood estimation**.
+
+The central idea is simple but easy to get wrong: a model assigns a *probability* to every choice a participant made, given everything that happened before it; the parameters that make the observed choices most probable are the best estimates.
+
+**What you will learn**
+
+- what the likelihood of a sequence of choices is, and why the model must be *replayed* on the participant's own history rather than simulated,
+- how to write the negative log-likelihood of the Rescorla–Wagner model and compute it by hand for a short sequence,
+- how to look at a likelihood surface and read identifiability off it,
+- how to find the maximum with an optimiser: parameter transforms and random restarts,
+- how to fit many participants, judge a fit against chance, and recognise the common pitfalls.
+
+**Prerequisites:** lessons 2 and 3.
+
+**Estimated time:** 2.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 5.1 Inverting the simulation
+
+In lesson 2 the likelihood was the probability of the data as a function of the parameter, $P(\text{data} \mid \theta)$, and the maximum-likelihood estimate was the $\theta$ that made the data most probable. For a coin that was easy: the outcomes were independent. A sequence of *choices* is not: what a participant chooses on trial $t$ depends on what they learned on trials $1, \dots, t-1$. The likelihood handles this through the chain rule of probability,
+
+$$
+P(c_1, c_2, \dots, c_T \mid \theta) = \prod_{t=1}^{T} P\big(c_t \mid \text{history}_t, \theta\big),
+$$
+
+where $\text{history}_t$ is everything that happened before trial $t$ — the earlier choices *and* the rewards they produced. Each factor is something the model from lesson 3 can compute: feed the model the participant's actual choices and rewards up to trial $t-1$, let it update its values exactly as it would have, and ask what probability its softmax assigns to the choice the participant then made on trial $t$.
+
+This is the crucial move. To compute a likelihood the model is **replayed on the participant's own history**: it never samples choices of its own; it only updates values from the observed choices and rewards, and scores each observed choice by its probability. The table below does this by hand for three trials of a two-armed bandit with $\alpha = 0.5$, $\beta = 2$, values starting at 0.5:
+
+| trial | values before the choice $Q(A), Q(B)$ | choice | $P(\text{choice})$ | reward | values after learning |
+|---|---|---|---|---|---|
+| 1 | 0.50, 0.50 | A | $\sigma(2 \cdot 0.00) = 0.500$ | 1 | 0.75, 0.50 |
+| 2 | 0.75, 0.50 | A | $\sigma(2 \cdot 0.25) = 0.622$ | 0 | 0.375, 0.50 |
+| 3 | 0.375, 0.50 | B | $\sigma(2 \cdot 0.125) = 0.562$ | 1 | 0.375, 0.75 |
+
+The likelihood of these three choices is $0.500 \times 0.622 \times 0.562 = 0.175$. Products of many probabilities become tiny, so, as in lesson 2, we work with the **negative log-likelihood** (NLL), a sum that we *minimise*:
+
+$$
+\text{NLL}(\theta) = -\sum_{t=1}^{T} \log P\big(c_t \mid \text{history}_t, \theta\big) .
+$$
+
+### ✏️ Exercise 5.1 — Why not fit by simulating? *(conceptual, written)*
+
+In 2–4 sentences: why can we *not* estimate a participant's parameters by simulating the model with candidate parameters and counting how many of the simulated choices match the participant's choices?
+
+# %% [exercise 5.1]
+check("5.1", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## 5.2 The negative log-likelihood of the Rescorla–Wagner model
+
+Turning the table into code is a loop over trials with one important detail of ordering: on each trial, **first** compute the choice probabilities from the current values and score the observed choice, **then** update the chosen option with the observed reward. The participant chose before seeing the outcome, so the probability must come from the values that existed before the outcome.
+
+```
+Q = (q0, q0, ...)
+nll = 0
+for each trial t:
+    p = softmax(Q, beta)            # probabilities from the values before the outcome
+    nll -= log p[c_t]               # score the choice the participant made
+    Q[c_t] += alpha * (r_t - Q[c_t])  # then learn from the reward they received
+return nll
+```
+
+### ✏️ Exercise 5.2 — The negative log-likelihood of the RW model *(coding)*
+
+Implement `nll_rw`. `params` is the pair `(alpha, beta)`; `choices` and `rewards` are the participant's arrays; `n_arms` and `q0` give the number of options and the initial value. Use `models.softmax` (or your own from lesson 3).
+
+# %%
+from rlcourse.models import softmax       # the (numerically stable) softmax of lesson 3
+
+# %% [exercise 5.2]
+def nll_rw(params, choices, rewards, n_arms=2, q0=0.5):
+    """Negative log-likelihood of choices under RW learning + softmax.  params = (alpha, beta)."""
+    alpha, beta = params
+    Q = np.full(n_arms, q0, dtype=float)
+    nll = 0.0
+    for c, r in zip(choices, rewards):
+        p = ...                           # <- choice probabilities from the current values
+        nll -= ...                        # <- log-probability of the observed choice
+        Q[c] = ...                        # <- learn from the observed reward
+    return nll
+
+check("5.2", nll_rw)
+
+# %% [markdown]
+To have data with a known answer we simulate one participant with the lesson 3 model: $\alpha = 0.3$, $\beta = 4$, 200 trials on a 70/30 bandit. The NLL at the true parameters should be lower than at wrong ones, and much lower than that of a model that chooses at random (probability ½ on every trial, NLL $= T \ln 2$).
+
+# %%
+nll_rw = use("5.2", nll_rw)
+
+true_alpha, true_beta = 0.3, 4.0
+subject = models.simulate_rw_bandit([0.7, 0.3], true_alpha, true_beta, n_trials=200, rng=rng)
+choices, rewards = subject["choices"], subject["rewards"]
+
+print(f"NLL at the true parameters (α = {true_alpha}, β = {true_beta}): {nll_rw((true_alpha, true_beta), choices, rewards):.2f}")
+for params in [(0.05, 4.0), (0.9, 4.0), (0.3, 0.5), (0.3, 20.0)]:
+    print(f"NLL at α = {params[0]:<4}, β = {params[1]:<4}: {nll_rw(params, choices, rewards):.2f}")
+print(f"NLL of a random chooser: {200 * np.log(2):.2f}")
+
+# %% [markdown]
+### ✏️ Exercise 5.3 — A two-trial likelihood by hand *(maths)*
+
+Values start at $q_0 = 0.5$, $\alpha = 0.5$, $\beta = 2$. The participant chooses option A twice and is rewarded both times. What is the negative log-likelihood of these two choices? (Use the two-option softmax $P(A) = 1/(1 + e^{-\beta (Q_A - Q_B)})$; give three decimals.)
+
+# %% [exercise 5.3]
+answer = None   # <- your number
+check("5.3", answer)
+
+# %% [markdown]
+## 5.3 The likelihood surface
+
+With two parameters we can simply evaluate the NLL on a grid and look at it. `fitting.grid_nll` does this for any model. The minimum of the surface is the maximum-likelihood estimate; its *shape* tells us how well the data pin the parameters down.
+
+# %%
+alpha_grid = np.linspace(0.02, 0.98, 49)
+beta_grid = np.linspace(0.2, 15, 50)
+surface = fitting.grid_nll(nll_rw, (choices, rewards), [alpha_grid, beta_grid])
+i_best, j_best = np.unravel_index(np.argmin(surface), surface.shape)
+print(f"grid minimum: α ≈ {alpha_grid[i_best]:.2f}, β ≈ {beta_grid[j_best]:.2f}, NLL = {surface[i_best, j_best]:.2f}")
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+levels = np.quantile(surface, [0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 0.9])
+cs = ax.contour(alpha_grid, beta_grid, surface.T, levels=levels, cmap=plotting.SEQUENTIAL + "_r")
+ax.clabel(cs, fmt="%.0f", fontsize=7)
+ax.plot(true_alpha, true_beta, "*", ms=14, color=plotting.PALETTE[7], label="true parameters")
+ax.plot(alpha_grid[i_best], beta_grid[j_best], "o", ms=8, color=plotting.PALETTE[0], label="grid minimum")
+ax.set(xlabel="learning rate α", ylabel="inverse temperature β", title="Negative log-likelihood surface (200 trials)")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+The valley is narrow in $\alpha$ but stretched in $\beta$: the data say fairly precisely how fast this participant learned, and less precisely how deterministic their choices were. Where the contours are far apart the NLL hardly changes, so many parameter values explain the data about equally well. Surfaces also get sharper with more data — try changing `n_trials` above to 50 or 1000 and re-running the two cells.
+
+### ✏️ Exercise 5.4 — Reading a likelihood surface *(conceptual)*
+
+The negative log-likelihood is nearly flat along one parameter (a long valley). What does this mean?
+
+**(a)** That parameter is estimated very precisely.
+**(b)** The data barely constrain that parameter: many values explain the choices about equally well, so its estimate is unreliable.
+**(c)** The model is wrong and should be discarded.
+**(d)** The optimiser is guaranteed to find the global minimum.
+
+# %% [exercise 5.4]
+check("5.4", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 5.4 Finding the minimum: optimisation
+
+A grid works for two parameters, but the hybrid model of lesson 9 has seven: a grid of 50 points per parameter would need $50^7 \approx 10^{12}$ evaluations. Instead we hand the NLL to a general-purpose **optimiser** — `scipy.optimize.minimize` — which starts somewhere, feels the slope of the surface and walks downhill until it cannot improve. Two practical problems come with this.
+
+**Constraints.** A learning rate must stay in $(0, 1)$ and an inverse temperature must be positive, but an optimiser happily proposes $\alpha = 1.3$ or $\beta = -2$, where the model is meaningless. The standard solution is to optimise *unconstrained* numbers $x$ and map them into the parameter space with a **transform**:
+
+$$
+\alpha = \sigma(x_1) = \frac{1}{1 + e^{-x_1}} \in (0, 1), \qquad \beta = e^{x_2} > 0 .
+$$
+
+Whatever $x$ the optimiser proposes, the parameters it implies are legal. The course labels these transforms by *kind*: `"unit"` for the sigmoid, `"pos"` for the exponential and `"real"` for no transform.
+
+**Local minima.** A downhill walker stops in the first valley it finds, which may not be the deepest, or on a plateau where the slope is too small to feel. The remedy is cheap: run the optimiser from several random starting points and keep the best result.
+
+### ✏️ Exercise 5.5 — Parameter transforms *(coding)*
+
+Implement the map from unconstrained values `x` to parameters according to `kinds` (a list with one entry per parameter: `"unit"`, `"pos"` or `"real"`).
+
+# %%
+from rlcourse.models import sigmoid, logit     # sigmoid(x) = 1 / (1 + exp(-x)); logit is its inverse
+print("sigmoid(0) =", sigmoid(0.0), "  logit(0.5) =", logit(0.5))
+
+# %% [exercise 5.5]
+def to_constrained(x, kinds):
+    """Map unconstrained values to parameters: 'unit' -> sigmoid(x), 'pos' -> exp(x), 'real' -> x."""
+    x = np.atleast_1d(np.asarray(x, float))
+    theta = np.empty_like(x)
+    for i, kind in enumerate(kinds):
+        if kind == "unit":
+            theta[i] = ...
+        elif kind == "pos":
+            theta[i] = ...
+        elif kind == "real":
+            theta[i] = ...
+        else:
+            raise ValueError(f"unknown kind {kind!r}")
+    return theta
+
+check("5.5", to_constrained)
+
+# %%
+to_constrained = use("5.5", to_constrained)
+
+x = np.linspace(-5, 5, 200)
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.3))
+axes[0].plot(x, [to_constrained([v], ["unit"])[0] for v in x]); axes[0].set(title="'unit': α = sigmoid(x)", xlabel="x (unconstrained)", ylabel="α")
+axes[1].plot(x, [to_constrained([v], ["pos"])[0] for v in x], color=plotting.PALETTE[1]); axes[1].set(title="'pos': β = exp(x)", xlabel="x (unconstrained)", ylabel="β", yscale="log")
+plt.show()
+print("x = (0, 0) corresponds to α =", to_constrained([0.0, 0.0], ["unit", "pos"])[0], " β =", to_constrained([0.0, 0.0], ["unit", "pos"])[1])
+
+# %% [markdown]
+### ✏️ Exercise 5.6 — Fit the RW model by maximum likelihood *(coding)*
+
+Write the complete fitting routine. Define an objective function of the unconstrained vector `x`: transform it with `to_constrained(x, ["unit", "pos"])` and return the NLL of the data. Minimise it with `scipy.optimize.minimize(objective, x0, method="L-BFGS-B")` from `n_starts` random starting points `x0 = rng.normal(0, 1.5, size=2)`, keep the result with the smallest `.fun`, and return `(alpha, beta, nll)` for the best one (parameters transformed back into their natural space).
+
+# %%
+from scipy.optimize import minimize
+
+# %% [exercise 5.6]
+def fit_rw(choices, rewards, n_starts, rng):
+    """Maximum-likelihood fit of the RW model.  Returns (alpha, beta, nll)."""
+    def objective(x):
+        raise NotImplementedError("transform x, then return the NLL of the data")
+
+    best = None
+    for _ in range(n_starts):
+        raise NotImplementedError("draw a random start, minimise, keep the best result")
+    raise NotImplementedError("transform the best x back and return (alpha, beta, nll)")
+
+check("5.6", fit_rw)
+
+# %%
+fit_rw = use("5.6", fit_rw)
+
+with np.errstate(divide="ignore", invalid="ignore"):     # a restart that begins at an extreme β can hit log(0): harmless
+    alpha_hat, beta_hat, nll_hat = fit_rw(choices, rewards, n_starts=10, rng=rng)
+print(f"maximum-likelihood estimate: α = {alpha_hat:.3f}, β = {beta_hat:.2f}   (true: α = {true_alpha}, β = {true_beta})")
+print(f"NLL at the estimate: {nll_hat:.2f}   at the true parameters: {nll_rw((true_alpha, true_beta), choices, rewards):.2f}")
+print(f"grid minimum from section 5.3: α = {alpha_grid[i_best]:.2f}, β = {beta_grid[j_best]:.2f}, NLL = {surface[i_best, j_best]:.2f}")
+
+# %% [markdown]
+The optimiser lands at (or very slightly below) the grid minimum, and the NLL at the estimate is a little *lower* than at the true parameters — as it must be: the estimate is by definition the point where the data are most probable, and 200 noisy choices never point exactly at the truth. The course function `fitting.fit_mle` does the same job for any model with any number of parameters; we use it from now on.
+
+# %%
+fit = fitting.fit_mle(models.nll_rw, (choices, rewards), kinds=["unit", "pos"], n_starts=10, rng=rng)
+print("fitting.fit_mle:  α = %.3f, β = %.2f, NLL = %.2f" % (fit["params"][0], fit["params"][1], fit["nll"]))
+
+# where did the individual restarts end up?
+ends = []
+for _ in range(8):
+    single = fitting.fit_mle(models.nll_rw, (choices, rewards), kinds=["unit", "pos"], n_starts=1, rng=rng)
+    ends.append((single["params"][0], single["params"][1], single["nll"]))
+print("\nsingle restarts (α, β, NLL):")
+for a, b, n in ends:
+    print(f"   {a:.3f}  {b:6.2f}  {n:.3f}")
+
+# %% [markdown]
+Here the restarts agree, which is what a trustworthy fit looks like. When they do not — when some runs end with a clearly worse NLL — the surface has traps, and keeping the best of many starts is the only protection.
+
+### ✏️ Exercise 5.7 — Why several starting points? *(conceptual)*
+
+Why do we run the optimiser from several random starting points and keep the best result?
+
+**(a)** To average the parameter estimates across runs.
+**(b)** Because the optimiser can get stuck in a local minimum or stop in a flat region; different starts explore different parts of the surface.
+**(c)** To estimate the uncertainty of the parameters from the spread of the runs.
+**(d)** Because scipy requires at least five calls to converge.
+
+# %% [exercise 5.7]
+check("5.7", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 5.5 How good is an estimate?
+
+An estimate is only as good as the data behind it. We simulate the same participant ($\alpha = 0.3$, $\beta = 4$) with 50, 200 and 1000 trials — eight times each, with different random outcomes — and fit every data set.
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+for n_trials, color in zip([50, 200, 1000], plotting.PALETTE[:3]):
+    estimates = []
+    for _ in range(8):
+        sim = models.simulate_rw_bandit([0.7, 0.3], true_alpha, true_beta, n_trials, rng)
+        fit = fitting.fit_mle(models.nll_rw, (sim["choices"], sim["rewards"]), ["unit", "pos"], n_starts=3, rng=rng)
+        estimates.append(fit["params"])
+    estimates = np.array(estimates)
+    jitter = rng.normal(0, 0.04, len(estimates))
+    axes[0].scatter(np.log10(n_trials) + jitter, estimates[:, 0], color=color, s=30, label=f"{n_trials} trials")
+    axes[1].scatter(np.log10(n_trials) + jitter, estimates[:, 1], color=color, s=30)
+for ax, true_value, name in zip(axes, [true_alpha, true_beta], ["α", "β"]):
+    ax.axhline(true_value, color="#52514e", ls="--", lw=1)
+    ax.set(xticks=np.log10([50, 200, 1000]), xticklabels=["50", "200", "1000"], xlabel="number of trials",
+           ylabel=f"estimated {name}", title=f"Estimates of {name} (dashed: true value)")
+axes[0].legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+With 50 trials the estimates scatter widely — some learning rates are off by a factor of two, and $\beta$ occasionally runs away. With 1000 trials they cluster tightly around the truth. This spread *is* the uncertainty of a fit; lesson 6 turns the idea into a systematic check (parameter recovery), and lesson 8 shows how to quantify it from a single data set (the posterior).
+
+## 5.6 Fitting many participants
+
+A study has many participants, each fitted separately. The loop below simulates 20 participants with their own parameters, fits each one and collects the results in a table. Before interpreting a single parameter, check that the model beats chance: a **pseudo-$R^2$** (McFadden's) compares the fitted NLL with that of a chooser who picks at random,
+
+$$
+\text{pseudo-}R^2 = 1 - \frac{\text{NLL}_{\text{model}}}{\text{NLL}_{\text{chance}}}, \qquad \text{NLL}_{\text{chance}} = T \ln k ,
+$$
+
+for $k$ options. It is 0 when the model does no better than chance and approaches 1 as the choices become perfectly predictable.
+
+# %%
+import pandas as pd
+
+rows = []
+for subj in range(20):
+    alpha_i = rng.beta(2, 4)                                   # a learning rate around 0.33
+    beta_i = np.exp(rng.normal(np.log(4), 0.4))                # an inverse temperature around 4
+    sim = models.simulate_rw_bandit([0.7, 0.3], alpha_i, beta_i, 200, rng)
+    fit = fitting.fit_mle(models.nll_rw, (sim["choices"], sim["rewards"]), ["unit", "pos"], n_starts=3, rng=rng)
+    rows.append({"subject": subj, "true_alpha": alpha_i, "true_beta": beta_i,
+                 "alpha": fit["params"][0], "beta": fit["params"][1], "nll": fit["nll"],
+                 "pseudo_R2": 1 - fit["nll"] / (200 * np.log(2))})
+fits = pd.DataFrame(rows)
+print(fits.round(3).head(8).to_string(index=False))
+print(f"\nmedian pseudo-R²: {fits.pseudo_R2.median():.2f}")
+
+plotting.plot_parameter_recovery(fits[["true_alpha", "true_beta"]].to_numpy(), fits[["alpha", "beta"]].to_numpy(), ["α", "β"])
+plt.show()
+
+# %% [markdown]
+The estimates track the truth, with more scatter for $\beta$ than for $\alpha$ — the same asymmetry the likelihood surface showed. This "simulate, fit, compare" loop is **parameter recovery**, the subject of lesson 6.
+
+### ✏️ Exercise 5.8 — Pseudo-R² of a fit *(maths)*
+
+A participant made 200 choices between two options and the fitted model has an NLL of 100. What is the pseudo-$R^2$?
+
+# %% [exercise 5.8]
+answer = None   # <- your number
+check("5.8", answer)
+
+# %% [markdown]
+## 5.7 Pitfalls
+
+Three things go wrong often enough to deserve a warning before you fit your own data.
+
+**Estimates at the boundary.** A participant who always picks the same option, or whose choices are almost perfectly consistent with their values, drives $\beta$ towards infinity (and the NLL towards 0 for those trials): the softmax can always fit deterministic choices better with a larger $\beta$. Likewise $\alpha$ can be pushed to 0 or 1. Such estimates are not "wrong", but they are not informative either. The cell below simulates a near-deterministic participant and plots the NLL as a function of $\beta$ — it never turns upward.
+
+# %%
+deterministic = models.simulate_rw_bandit([0.9, 0.1], 0.5, 50.0, 150, rng)
+betas = np.linspace(1, 200, 100)
+nlls = [nll_rw((0.5, b), deterministic["choices"], deterministic["rewards"]) for b in betas]
+fig, ax = plt.subplots(figsize=(6.5, 3.4))
+ax.plot(betas, nlls)
+ax.set(xlabel="inverse temperature β (α fixed at 0.5)", ylabel="NLL", title="A near-deterministic participant: the NLL keeps falling as β grows")
+plt.show()
+
+# %% [markdown]
+**Trade-offs between parameters.** The likelihood surface of section 5.3 had a slanted valley: a slightly larger $\alpha$ with a slightly smaller $\beta$ explains the data almost as well. Fitted $\alpha$ and $\beta$ are therefore correlated across restarts and across participants, and a between-group difference in one can masquerade as a difference in the other. Lesson 6 measures this, and lesson 14 discusses what it means for interpreting parameters as traits.
+
+**Wrong or incomplete models.** Maximum likelihood always returns *some* estimate, even for a model that cannot have generated the data. A fit tells you nothing about whether the model is right — that is what model comparison and posterior predictive checks (lesson 7) are for. Palminteri, Wyart & Koechlin (2017) call this the need for *falsification*.
+
+The practical remedy for the first two problems is to bring in prior knowledge: a prior that gently discourages absurd values turns maximum likelihood into *maximum a posteriori* estimation, and fitting all participants together lets the group inform each individual (lesson 8).
+
+## Summary
+
+- The likelihood of a choice sequence is the product over trials of the probability the model assigns to each observed choice, given the history — the model is **replayed** on the participant's data, never simulated.
+- We minimise the **negative log-likelihood**; for the RW model this means: on every trial compute the softmax probability of the observed choice from the current values, *then* update the chosen value with the observed reward.
+- The **likelihood surface** shows how precisely the data pin down each parameter; flat valleys mean poor identifiability.
+- **Optimisers** find the minimum from random starts; **transforms** (sigmoid, exp) keep parameters in range; **restarts** protect against local minima and plateaus.
+- Judge every fit against chance (**pseudo-$R^2$**) and expect boundary estimates, parameter trade-offs and uninformative fits — the problems lessons 6–8 address.
+
+## What's next
+
+A fit can look fine and still be meaningless. Lesson 6 asks the two questions you must answer before trusting any estimate: if the model generated data with known parameters, would fitting recover them (**parameter recovery**)? And if several models could have generated the data, would fitting tell them apart (**model recovery**)?
+
+## References
+
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press.
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547
+- Myung, I. J. (2003). Tutorial on maximum likelihood estimation. *Journal of Mathematical Psychology, 47*(1), 90–100. https://doi.org/10.1016/S0022-2496(02)00028-7
+- Palminteri, S., Wyart, V., & Koechlin, E. (2017). The importance of falsification in computational cognitive modeling. *Trends in Cognitive Sciences, 21*(6), 425–433. https://doi.org/10.1016/j.tics.2017.03.011
+- Lee, M. D., & Wagenmakers, E.-J. (2013). *Bayesian Cognitive Modeling: A Practical Course*. Cambridge University Press.

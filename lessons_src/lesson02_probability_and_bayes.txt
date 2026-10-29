@@ -1,0 +1,421 @@
+# %% [markdown]
+# Lesson 2 — Probability and Bayes for modellers
+
+Fitting a model to behaviour means asking *how probable are these choices under this model?* — a probability question. Bayesian learners (lessons 11–12) update their beliefs about the world with Bayes' rule, and Bayesian estimation (lesson 8) does the same for a model's parameters. Everything you need for all of this can be learned on the simplest possible example: **one option that pays off with an unknown probability $p$** — a coin with an unknown bias.
+
+This lesson assumes no background in probability or statistics. It is the foundation for lessons 5–8 and 11–12; if the words *likelihood*, *prior* and *posterior* are already old friends, skim it and do the exercises.
+
+**What you will learn**
+
+- the distributions the course uses (Bernoulli, binomial, Gaussian, Beta), and the difference between a random variable and a parameter,
+- the **likelihood**: the data held fixed, the parameter varied; why we take logs; the maximum-likelihood estimate,
+- **Bayes' rule**, computed on a grid and in closed form (Beta–Bernoulli conjugacy); priors, posteriors and posterior summaries,
+- the **posterior predictive**: predicting the next outcome by averaging over what we do not know,
+- why updating a posterior outcome by outcome is a form of *learning* with a learning rate that shrinks over trials.
+
+**Prerequisites:** lesson 1.
+
+**Estimated time:** 2 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 2.1 Distributions you need
+
+A **random variable** is a quantity whose value is uncertain before we observe it; a **distribution** assigns a probability to each value it can take. A **parameter** is a fixed number that shapes the distribution. For a single outcome of our option, the random variable is the outcome $X \in \{0, 1\}$ and the parameter is the reward probability $p$:
+
+$$
+P(X = x \mid p) = p^{x}(1-p)^{1-x}, \qquad x \in \{0, 1\} \qquad \text{(Bernoulli)}
+$$
+
+This compact formula just says $P(X = 1) = p$ and $P(X = 0) = 1 - p$ (check: put $x = 1$, then $x = 0$). Four distributions cover almost everything in this course:
+
+| distribution | random variable | parameters | where it appears |
+|---|---|---|---|
+| **Bernoulli**($p$) | one outcome, 0 or 1 | $p$ | every reward in a bandit |
+| **Binomial**($n, p$) | number of successes in $n$ independent Bernoulli trials | $n, p$ | counting rewards |
+| **Gaussian** / normal($\mu, \sigma^2$) | a continuous quantity | mean $\mu$, variance $\sigma^2$ | continuous rewards, priors on parameters, the Kalman filter (lesson 11) |
+| **Beta**($a, b$) | a number between 0 and 1 — i.e. *a probability* | $a, b > 0$ | beliefs about $p$ (this lesson, lesson 11) |
+
+The Beta distribution deserves a closer look because it is a distribution *over probabilities*: it is the natural way to express a belief about $p$. Its density is
+
+$$
+\text{Beta}(p \mid a, b) \propto p^{\,a-1}(1-p)^{\,b-1},
+$$
+
+its mean is $a/(a+b)$, and larger $a + b$ means a narrower (more confident) distribution. We use `scipy.stats` for all standard distributions.
+
+# %%
+from scipy import stats
+
+fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.4))
+k = np.arange(0, 11)
+axes[0].bar(k, stats.binom.pmf(k, n=10, p=0.7), color=plotting.PALETTE[0])
+axes[0].set(xlabel="number of successes in 10 trials", ylabel="probability", title="Binomial(n = 10, p = 0.7)")
+x = np.linspace(-4, 4, 300)
+axes[1].plot(x, stats.norm.pdf(x, loc=0, scale=1), label="N(0, 1)")
+axes[1].plot(x, stats.norm.pdf(x, loc=1, scale=0.5), label="N(1, 0.5²)")
+axes[1].set(xlabel="value", ylabel="density", title="Gaussian")
+axes[1].legend()
+p_grid = np.linspace(0, 1, 300)
+for a, b in [(1, 1), (2, 2), (5, 2), (2, 5), (20, 20)]:
+    axes[2].plot(p_grid, stats.beta.pdf(p_grid, a, b), label=f"Beta({a}, {b})")
+axes[2].set(xlabel="p", ylabel="density", title="Beta: distributions over a probability")
+axes[2].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+Beta(1, 1) is flat: every value of $p$ equally plausible. Beta(5, 2) leans towards high $p$, Beta(2, 5) towards low $p$, and Beta(20, 20) is confidently centred on 0.5. Keep this figure in mind: in section 2.4 these will be our *prior beliefs* about $p$.
+
+## 2.2 The likelihood
+
+Suppose we chose our option ten times and observed
+
+# %%
+outcomes = np.array([1, 1, 0, 1, 1, 1, 0, 1, 1, 0])     # 7 successes in 10 trials
+print("number of successes:", outcomes.sum(), "of", len(outcomes))
+
+# %% [markdown]
+Because the trials are independent, the probability of this exact sequence, for a given $p$, is the product of the probabilities of its outcomes:
+
+$$
+P(\text{data} \mid p) = \prod_{t=1}^{10} p^{x_t}(1-p)^{1-x_t} = p^{7}(1-p)^{3}.
+$$
+
+Now comes the conceptual move that underlies all model fitting. **Hold the data fixed and let $p$ vary.** $P(\text{data} \mid p)$ then becomes a function of $p$ — the **likelihood function** $L(p)$ — which tells us, for each candidate value of $p$, how probable *these* data would have been. Values of $p$ with higher likelihood are better supported by the data.
+
+Two things to notice before we compute it:
+
+- $L(p)$ is **not a probability distribution over $p$**: nothing makes its area equal to 1. It is a probability of the *data*, read as a function of the parameter.
+- The product of ten probabilities is already a small number ($0.7^7 \cdot 0.3^3 \approx 0.002$); for a 200-trial experiment the product of 200 probabilities underflows the precision of a computer. That is why we always work with the **log-likelihood**,
+
+$$
+\log L(p) = \sum_{t} \big[x_t \log p + (1-x_t)\log(1-p)\big] = k \log p + (n-k) \log(1-p),
+$$
+
+where $k$ is the number of successes in $n$ trials. The log turns the product into a sum, and because the log is monotonic the maximum is at the same $p$.
+
+### ✏️ Exercise 2.1 — The Bernoulli log-likelihood *(coding)*
+
+Implement $\log L(p)$ for an array of 0/1 outcomes.
+
+# %% [exercise 2.1]
+def bernoulli_log_likelihood(p, outcomes):
+    """log p(outcomes | p) for independent Bernoulli(p) outcomes (0/1)."""
+    outcomes = np.asarray(outcomes, dtype=float)
+    return ...          # <- sum over outcomes of: x log p + (1 - x) log(1 - p)
+
+check("2.1", bernoulli_log_likelihood)
+
+# %%
+bernoulli_log_likelihood = use("2.1", bernoulli_log_likelihood)
+
+p_grid = np.linspace(0.01, 0.99, 99)
+log_lik = np.array([bernoulli_log_likelihood(p, outcomes) for p in p_grid])
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+axes[0].plot(p_grid, np.exp(log_lik))
+axes[0].set(xlabel="p", ylabel="L(p) = P(data | p)", title="Likelihood of 7 successes in 10 trials")
+axes[1].plot(p_grid, log_lik)
+axes[1].set(xlabel="p", ylabel="log L(p)", title="Log-likelihood (same information, better numbers)")
+for ax in axes:
+    ax.axvline(0.7, color="#52514e", ls="--", lw=1)
+plt.show()
+print("the grid point with the highest likelihood is p =", p_grid[np.argmax(log_lik)])
+
+# %% [markdown]
+The value of $p$ at which the likelihood is largest is the **maximum-likelihood estimate (MLE)**. For a Bernoulli sequence it is simply the proportion of successes, $k/n$ — exercise 2.3 asks you to show why. Lesson 5 does exactly the same thing with a learning model: the "data" become a participant's sequence of choices, the "parameter" becomes the learning rate and inverse temperature, and the MLE is found numerically.
+
+And here is the underflow problem in one line:
+
+# %%
+many_probabilities = np.full(500, 0.3)
+print("product of 500 probabilities of 0.3:", np.prod(many_probabilities))        # underflows to exactly 0
+print("sum of their logs:                 ", np.sum(np.log(many_probabilities)))   # perfectly fine
+
+# %% [markdown]
+### ✏️ Exercise 2.2 — A log-likelihood by hand *(maths)*
+
+Four outcomes were observed: 1, 1, 1, 0. What is the log-likelihood at $p = 0.75$? (Natural logarithm; give three decimals.)
+
+# %% [exercise 2.2]
+answer = None   # <- your number
+check("2.2", answer)
+
+# %% [markdown]
+### ✏️ Exercise 2.3 — The maximum-likelihood estimate *(maths)*
+
+Show that the MLE of $p$ for $k$ successes in $n$ trials is $k/n$: differentiate $\log L(p) = k \log p + (n - k)\log(1-p)$ with respect to $p$, set the derivative to zero and solve. Then enter the MLE for our data (7 successes in 10 trials).
+
+# %% [exercise 2.3]
+answer = None   # <- your number
+check("2.3", answer)
+
+# %% [markdown]
+### ✏️ Exercise 2.4 — Why work with log-likelihoods? *(conceptual)*
+
+Why do we work with the log-likelihood rather than the likelihood itself?
+
+**(a)** Taking the log turns the likelihood into a probability distribution over the parameter.
+**(b)** Products of many small probabilities underflow to zero in floating point, whereas sums of logs do not; sums are also easier to differentiate and optimise, and the maximum is at the same place.
+**(c)** Bayes' rule can only be applied to logarithms.
+**(d)** The log-likelihood is always positive, which optimisers require.
+
+# %% [exercise 2.4]
+check("2.4", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 2.3 Bayes' rule on a grid
+
+The likelihood tells us how well each $p$ explains the data, but it does not tell us how *probable* each $p$ is. For that we need **Bayes' rule**:
+
+$$
+\underbrace{P(p \mid \text{data})}_{\text{posterior}} = \frac{\overbrace{P(\text{data} \mid p)}^{\text{likelihood}} \; \overbrace{P(p)}^{\text{prior}}}{\underbrace{P(\text{data})}_{\text{evidence}}} .
+$$
+
+In words: *what we believe after seeing the data* is proportional to *how well each value explains the data* times *what we believed before*. The denominator, the evidence, is the same number for every $p$ (it is the probability of the data averaged over all values of $p$); its only job is to make the posterior integrate to 1.
+
+The simplest way to compute a posterior is on a **grid** of candidate values: evaluate prior and likelihood at each grid point, multiply, and divide by the sum. This works for any prior and any likelihood — it is the method to reach for when no formula is available.
+
+### ✏️ Exercise 2.5 — Bayes' rule on a grid *(coding)*
+
+Given arrays `prior` and `likelihood` evaluated on the same grid, return the posterior (an array that sums to 1).
+
+# %% [exercise 2.5]
+def grid_posterior(prior, likelihood):
+    """Bayes' rule on a grid: posterior ∝ prior × likelihood, normalised to sum to 1."""
+    unnormalised = ...                  # <- prior times likelihood, point by point
+    return ...                          # <- divide by the sum
+
+check("2.5", grid_posterior)
+
+# %% [markdown]
+Let's see what three different priors do to the posterior, after 10 trials (7 successes) and after 100 trials (70 successes). The priors are Beta densities evaluated on the grid: flat, confidently centred on 0.5, and leaning towards low $p$.
+
+# %%
+grid_posterior = use("2.5", grid_posterior)
+
+priors = {"flat  Beta(1, 1)": stats.beta.pdf(p_grid, 1, 1),
+          "centred  Beta(10, 10)": stats.beta.pdf(p_grid, 10, 10),
+          "pessimistic  Beta(2, 5)": stats.beta.pdf(p_grid, 2, 5)}
+outcomes_100 = np.r_[np.ones(70), np.zeros(30)]                   # exactly 70 successes in 100 trials
+datasets = {"10 trials (7 successes)": outcomes, "100 trials (70 successes)": outcomes_100}
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.6), sharey=False)
+for name, prior in priors.items():
+    axes[0].plot(p_grid, prior / prior.sum(), label=name)
+axes[0].set(title="prior", xlabel="p", ylabel="probability (on the grid)")
+axes[0].legend(fontsize=8)
+for ax, (data_name, data) in zip(axes[1:], datasets.items()):
+    likelihood = np.exp([bernoulli_log_likelihood(p, data) for p in p_grid])
+    for name, prior in priors.items():
+        ax.plot(p_grid, grid_posterior(prior, likelihood), label=name)
+    ax.axvline(data.mean(), color="#52514e", ls="--", lw=1, label="MLE")
+    ax.set(title=f"posterior after {data_name}", xlabel="p")
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+With 10 trials the prior matters: the posterior under the confident Beta(10, 10) prior stays close to 0.5. With 100 trials all three posteriors pile up near the MLE — the data overwhelm the prior. This is the general pattern: priors matter when data are scarce, which is exactly the situation in a typical experiment with a few hundred trials and several parameters per participant (lesson 8).
+
+## 2.4 Conjugacy: the Beta–Bernoulli family
+
+For the Bernoulli likelihood there is a formula that makes the grid unnecessary. If the prior is Beta($a_0, b_0$) and we observe $k$ successes and $n - k$ failures, then
+
+$$
+\text{posterior} \;\propto\; \underbrace{p^{\,a_0-1}(1-p)^{\,b_0-1}}_{\text{prior}} \cdot \underbrace{p^{\,k}(1-p)^{\,n-k}}_{\text{likelihood}} \;=\; p^{\,a_0+k-1}(1-p)^{\,b_0+n-k-1},
+$$
+
+which is again a Beta density: **the posterior is Beta($a_0 + k,\; b_0 + n - k$)**. A prior that keeps its family after the update is called **conjugate**, and the parameters $a$ and $b$ have a lovely interpretation: they are *pseudo-counts* of successes and failures. A Beta(1, 1) prior is like having seen one success and one failure before the experiment started; Beta(20, 20) is like having seen forty balanced outcomes, which is why it resists the data.
+
+### ✏️ Exercise 2.6 — The Beta–Bernoulli update *(coding)*
+
+Return the posterior parameters $(a, b)$ after observing an array of 0/1 outcomes under a Beta($a_0, b_0$) prior.
+
+# %% [exercise 2.6]
+def beta_posterior(a0, b0, outcomes):
+    """Conjugate update of a Beta(a0, b0) prior with Bernoulli outcomes.
+
+    Returns the posterior parameters (a, b) = (a0 + #successes, b0 + #failures).
+    """
+    outcomes = np.asarray(outcomes, dtype=float)
+    n_success = ...
+    n_failure = ...
+    return a0 + n_success, b0 + n_failure
+
+check("2.6", beta_posterior)
+
+# %% [markdown]
+With a posterior in closed form we can summarise it exactly. The usual summaries are
+
+- the **posterior mean** $a/(a+b)$ (the best guess under squared error),
+- the **posterior mode** $(a-1)/(a+b-2)$ (the most probable value; for a flat prior it coincides with the MLE),
+- a **credible interval**, e.g. the central 95% of the posterior, from the quantile function.
+
+Let's check that the formula agrees with the grid, and compute the summaries for our 7-of-10 data under a flat prior.
+
+# %%
+beta_posterior = use("2.6", beta_posterior)
+
+a, b = beta_posterior(1, 1, outcomes)
+print(f"posterior: Beta({a:.0f}, {b:.0f})")
+print(f"posterior mean  = {a / (a + b):.3f}")
+print(f"posterior mode  = {(a - 1) / (a + b - 2):.3f}   (= the MLE for a flat prior)")
+lo, hi = stats.beta.ppf([0.025, 0.975], a, b)
+print(f"95% credible interval = [{lo:.3f}, {hi:.3f}]")
+
+likelihood = np.exp([bernoulli_log_likelihood(p, outcomes) for p in p_grid])
+fig, ax = plt.subplots(figsize=(7, 3.6))
+ax.plot(p_grid, grid_posterior(np.ones_like(p_grid), likelihood) / (p_grid[1] - p_grid[0]), lw=4, alpha=0.4, label="grid posterior (flat prior), as a density")
+ax.plot(p_grid, stats.beta.pdf(p_grid, a, b), label=f"Beta({a:.0f}, {b:.0f}) from the formula")
+ax.axvspan(lo, hi, color=plotting.PALETTE[0], alpha=0.1, label="95% credible interval")
+ax.set(xlabel="p", ylabel="posterior density", title="The conjugate formula agrees with the grid")
+ax.legend(fontsize=9)
+plt.show()
+
+# %% [markdown]
+### ✏️ Exercise 2.7 — The posterior mean *(maths)*
+
+With a Beta(1, 1) prior and the 7-of-10 data, what is the posterior mean of $p$? Give three decimals (and compare it with the MLE).
+
+# %% [exercise 2.7]
+answer = None   # <- your number
+check("2.7", answer)
+
+# %% [markdown]
+### ✏️ Exercise 2.8 — A posterior probability *(maths)*
+
+Under the same posterior, what is the probability that the option is better than chance, $P(p > 0.5 \mid \text{data})$? Use `scipy.stats.beta` (`cdf` gives the area to the left of a value, `sf` the area to the right) and give three decimals.
+
+# %% [exercise 2.8]
+answer = None   # <- your number (you may compute it in this cell)
+check("2.8", answer)
+
+# %% [markdown]
+## 2.5 Sequential updating is learning
+
+Nothing forces us to wait for all the data. We can update the posterior after every single outcome: today's posterior becomes tomorrow's prior. With the conjugate formula each outcome just adds 1 to $a$ or to $b$.
+
+# %%
+outcomes_50 = (rng.random(50) < 0.7).astype(float)
+a, b = 1.0, 1.0
+snapshots = {0: (a, b)}
+posterior_means, learning_rates = [], []
+for t, x in enumerate(outcomes_50, start=1):
+    learning_rates.append(1 / (a + b + 1))          # see the derivation below
+    a, b = beta_posterior(a, b, [x])
+    posterior_means.append(a / (a + b))
+    if t in (1, 2, 5, 10, 50):
+        snapshots[t] = (a, b)
+
+fig, ax = plt.subplots(figsize=(7, 3.6))
+for t, (a_t, b_t) in snapshots.items():
+    ax.plot(p_grid, stats.beta.pdf(p_grid, a_t, b_t), label=f"after {t} outcomes: Beta({a_t:.0f}, {b_t:.0f})")
+ax.axvline(0.7, color="#52514e", ls="--", lw=1)
+ax.set(xlabel="p", ylabel="posterior density", title="The posterior sharpens as outcomes accumulate (true p = 0.7)")
+ax.legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+Now look at how the **posterior mean** moves from one outcome to the next. Write $m_t = a_t/(a_t + b_t)$ and $n_t = a_t + b_t$. After an outcome $x$ (which adds 1 to $a$ if $x = 1$, to $b$ if $x = 0$), the new mean is $(a_t + x)/(n_t + 1)$, and a little algebra gives
+
+$$
+m_{t+1} = m_t + \frac{1}{n_t + 1}\,(x - m_t).
+$$
+
+This is a **delta rule**: the estimate moves towards the outcome by a fraction of the prediction error $x - m_t$ — the same form as the Rescorla–Wagner rule of lesson 3 — except that the **learning rate** $1/(n_t + 1)$ *shrinks* as evidence accumulates. The Bayesian learner trusts each new outcome less and less, which is optimal when $p$ never changes.
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+axes[0].plot(np.arange(1, 51), posterior_means, marker="o", ms=3, label="posterior mean")
+axes[0].plot(np.arange(1, 51), models.running_mean(outcomes_50), ls=":", color="#52514e", label="running mean (MLE)")
+axes[0].axhline(0.7, color="#52514e", ls="--", lw=1)
+axes[0].set(xlabel="outcome number", ylabel="estimate of p", title="Estimate after each outcome")
+axes[0].legend(fontsize=9)
+axes[1].plot(np.arange(1, 51), learning_rates, label="Bayesian learner: 1 / (a + b + 1)")
+axes[1].axhline(0.1, color=plotting.PALETTE[1], ls="--", label="constant learning rate (lesson 3)")
+axes[1].set(xlabel="outcome number", ylabel="learning rate", title="The Bayesian learning rate shrinks")
+axes[1].legend(fontsize=9)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+This plot previews a theme of the whole course. A shrinking learning rate is ideal in a world that stays the same; a *constant* learning rate (lesson 3) deliberately forgets, which helps when the world changes; and lessons 11–12 build learners that estimate *how changeable* the world is and set their learning rate accordingly.
+
+## 2.6 The posterior predictive
+
+Estimating $p$ is one thing; predicting the **next outcome** is another. The Bayesian prediction averages the Bernoulli probability over everything we still do not know about $p$:
+
+$$
+P(x_{\text{next}} = 1 \mid \text{data}) = \int_0^1 p \; \text{Beta}(p \mid a, b)\, dp = \frac{a}{a+b}.
+$$
+
+For a single outcome this happens to equal the posterior mean, but the principle — *predictions integrate over parameter uncertainty* — is general and matters whenever the prediction is a non-linear function of the parameter. For instance the probability of **two** successes in a row is $E[p^2]$, which is larger than $(E[p])^2$ because uncertainty about $p$ adds variance:
+
+# %%
+a, b = beta_posterior(1, 1, outcomes)                 # Beta(8, 4)
+mean_p = a / (a + b)
+mean_p_squared = a * (a + 1) / ((a + b) * (a + b + 1))  # E[p^2] for a Beta(a, b)
+print(f"P(next = 1 | data)        = E[p]   = {mean_p:.3f}")
+print(f"P(next two = 1 | data)    = E[p^2] = {mean_p_squared:.3f}   (not E[p]^2 = {mean_p ** 2:.3f})")
+samples = stats.beta.rvs(a, b, size=100000, random_state=rng)
+print(f"check by sampling p from the posterior: mean(p^2) = {np.mean(samples ** 2):.3f}")
+
+# %% [markdown]
+Sampling from the posterior, as in the last line, is the workhorse of practical Bayesian computation: when integrals have no formula, we draw many values of the parameter from the posterior and average whatever we want to predict (lesson 8 shows how to obtain such samples for a learning model with Markov chain Monte Carlo).
+
+## 2.7 Likelihood versus posterior
+
+Two objects look alike and are constantly confused: the likelihood $P(\text{data} \mid p)$ and the posterior $P(p \mid \text{data})$. Both vary with $p$. Only one is a distribution over $p$.
+
+### ✏️ Exercise 2.9 — Which one is a distribution over the parameter? *(conceptual)*
+
+Which of the following is a probability distribution over the parameter $p$?
+
+**(a)** the likelihood $P(\text{data} \mid p)$, viewed as a function of $p$
+**(b)** the posterior $P(p \mid \text{data})$
+**(c)** the Bernoulli probability $P(x \mid p)$ of a single outcome
+**(d)** the evidence $P(\text{data})$
+
+# %% [exercise 2.9]
+check("2.9", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+### ✏️ Exercise 2.10 — Likelihood versus posterior *(conceptual, written)*
+
+In 2–4 sentences: what is the difference between $P(\text{data} \mid \theta)$ and $P(\theta \mid \text{data})$? (We write $\theta$ for a generic parameter; in this lesson $\theta = p$.) Write your answer in the string below; the checker looks for the key ideas and then shows a model answer.
+
+# %% [exercise 2.10]
+check("2.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- A **random variable** has a distribution; a **parameter** is a fixed number that shapes it. Bernoulli, binomial, Gaussian and Beta cover the course; the **Beta** is a distribution over a probability and therefore the natural belief about $p$.
+- The **likelihood** $L(\theta) = P(\text{data} \mid \theta)$ holds the data fixed and varies the parameter. It is *not* a distribution over $\theta$. Work with the **log-likelihood** (sums instead of products); its maximum is the **MLE**, which for a Bernoulli sequence is the proportion of successes.
+- **Bayes' rule**: posterior $\propto$ likelihood $\times$ prior. On a grid it is two lines of code; with a conjugate prior it is a formula: Beta($a_0, b_0$) + $k$ successes and $n-k$ failures → Beta($a_0 + k, b_0 + n - k$). The prior matters when data are scarce.
+- Summarise a posterior by its **mean**, **mode** and a **credible interval**; answer questions like $P(p > 0.5 \mid \text{data})$ directly.
+- The **posterior predictive** averages predictions over parameter uncertainty; sampling from the posterior is how this is done in practice.
+- Updating after every outcome is **learning**: the posterior mean follows a delta rule with a learning rate $1/(a + b + 1)$ that shrinks over trials.
+
+## What's next
+
+Lesson 3 builds the first real learning agent: the Rescorla–Wagner rule, a delta rule with a *constant* learning rate, and the softmax rule that turns values into choices. Lesson 5 will then use the likelihood machinery of this lesson to fit that agent to behaviour, and lesson 8 will put priors on its parameters.
+
+## References
+
+- Lee, M. D., & Wagenmakers, E.-J. (2013). *Bayesian Cognitive Modeling: A Practical Course*. Cambridge University Press. — chapters 1–3 cover exactly the material of this lesson, with many worked examples.
+- McElreath, R. (2020). *Statistical Rethinking* (2nd ed.). CRC Press. — chapter 2 ("Small worlds and large worlds") introduces grid approximation and the Beta–binomial model gently.
+- Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A., & Rubin, D. B. (2013). *Bayesian Data Analysis* (3rd ed.). CRC Press. — the reference text; chapter 2 for conjugate families.
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press. — how the likelihood of this lesson becomes the likelihood of a learning model.

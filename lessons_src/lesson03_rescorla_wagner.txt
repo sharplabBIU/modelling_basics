@@ -1,0 +1,432 @@
+# %% [markdown]
+# Lesson 3 — Model-free learning I: Rescorla–Wagner, prediction errors and softmax choice
+
+How does an agent that knows nothing about a task come to prefer the option that pays off most often? The simplest answer in the field is also the most important one: keep a running estimate of how good each option is, and nudge that estimate every time the outcome differs from what you expected. This is the **Rescorla–Wagner (RW) rule**, the backbone of model-free reinforcement learning (RL) and of most computational models of learning in psychology, neuroscience and psychiatry.
+
+In this lesson you will build the rule from scratch, turn values into choices with the **softmax** rule, simulate a complete agent on a bandit task, and discover why there is no "right" learning rate.
+
+**What you will learn**
+
+- the delta rule / RW update and the idea of a *reward prediction error*,
+- what the learning rate $\alpha$ really does (it sets how much of the past you remember),
+- how to turn values into choice probabilities with the softmax rule and the inverse temperature $\beta$,
+- how to simulate an agent on a task, and how $\alpha$ and $\beta$ shape behaviour,
+- the stability–flexibility trade-off that motivates the Bayesian learners of lessons 11–12.
+
+**Prerequisites:** lessons 1 and 2 (simulation, probability).
+
+**Estimated time:** 2 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 3.1 The problem: learning from noisy rewards
+
+Our running example is the **two-armed bandit**: on every trial the participant chooses one of two options (think of two slot machines, two decks of cards, two doors) and receives a reward or not. Option A pays with probability 0.7, option B with probability 0.3 — but the participant is not told this and sees only its own outcomes.
+
+The course package provides the task. `rng` is the random number generator we fixed in the setup cell; passing it around makes every simulation reproducible.
+
+# %%
+bandit = tasks.Bandit(probs=[0.7, 0.3], rng=rng)
+
+# pull arm 0 ten times and arm 1 ten times
+rewards_A = [bandit.step(0) for _ in range(10)]
+rewards_B = [bandit.step(1) for _ in range(10)]
+print("ten outcomes of A:", rewards_A, "-> mean", np.mean(rewards_A))
+print("ten outcomes of B:", rewards_B, "-> mean", np.mean(rewards_B))
+
+# %% [markdown]
+Two things make this hard. Rewards are **noisy** (a 70% option fails three times in ten on average), and in real tasks the probabilities often **change** over time. An agent needs a way to turn a stream of 0s and 1s into a belief about each option that is good enough to act on.
+
+## 3.2 The Rescorla–Wagner rule
+
+Rescorla and Wagner (1972) proposed, for Pavlovian conditioning, that learning is driven by **surprise**: the difference between the outcome that occurred and the outcome that was predicted. The same equation was derived independently in engineering as the Widrow–Hoff or *delta rule*, and it is the one-step special case of the temporal-difference learning you will meet in lesson 4.
+
+Write $V_t$ for the agent's estimate of the value of an option before trial $t$ and $R_t$ for the reward it then receives. The update is
+
+$$
+\delta_t = R_t - V_t \qquad\text{(reward prediction error)}
+$$
+
+$$
+V_{t+1} = V_t + \alpha\,\delta_t \qquad\text{(the update)}
+$$
+
+where $\alpha \in [0, 1]$ is the **learning rate**. If the reward was larger than predicted ($\delta_t > 0$) the value goes up; if smaller, it goes down; if the prediction was exactly right, nothing changes. Only the option that was chosen (and whose outcome was observed) is updated.
+
+The prediction error $\delta$ is not just a computational convenience: Schultz, Dayan and Montague (1997) showed that midbrain dopamine neurons fire in a way that closely matches it, which is why this quantity is central to the neuroscience of learning (lesson 4).
+
+# %% [markdown]
+### ✏️ Exercise 3.1 — The Rescorla–Wagner update *(coding)*
+
+Implement one RW update. The function receives the current `value`, the observed `reward` and the learning rate `alpha`, and returns the new value. Replace the two `...` placeholders.
+
+# %% [exercise 3.1]
+def rw_update(value, reward, alpha):
+    """One Rescorla–Wagner (delta-rule) update:  V <- V + alpha * (R - V)."""
+    prediction_error = ...          # <- the surprise: what happened minus what was expected
+    new_value = ...                 # <- move the value a fraction alpha of the way towards the reward
+    return new_value
+
+check("3.1", rw_update)
+
+# %% [markdown]
+Let's watch the rule at work. We feed one option's outcomes (70% rewarded) to three learners with different learning rates and plot their value estimates. The dashed line is the true reward probability.
+
+# %%
+rw_update = use("3.1", rw_update)      # your function if it passes the check, else the reference
+
+n_trials = 60
+outcomes = (rng.random(n_trials) < 0.7).astype(float)     # the same outcome sequence for all three learners
+
+fig, ax = plt.subplots(figsize=(7.5, 4))
+for alpha in [0.05, 0.2, 0.8]:
+    V = 0.5                                                # start half-way: "no idea"
+    history = []
+    for r in outcomes:
+        history.append(V)                                  # value *before* seeing this outcome
+        V = rw_update(V, r, alpha)
+    ax.plot(history, label=f"α = {alpha}")
+ax.plot(np.where(outcomes == 1)[0], np.full(int(outcomes.sum()), 1.03), "|", color="#52514e", label="rewarded trials")
+ax.axhline(0.7, color="#52514e", ls="--", lw=1, label="true probability")
+ax.set(xlabel="trial", ylabel="value estimate V", title="Rescorla–Wagner learning of a 70% option", ylim=(0, 1.08))
+ax.legend(loc="lower right", ncol=2)
+plt.show()
+
+# %% [markdown]
+With a small $\alpha$ the estimate creeps towards 0.7 and then stays near it; with a large $\alpha$ it gets there almost immediately but then jumps up and down with every outcome. Keep this picture in mind — it is the whole story of the learning rate.
+
+### ✏️ Exercise 3.2 — Two updates by hand *(maths)*
+
+An option starts with value $V = 0.5$ and the learning rate is $\alpha = 0.2$. The option is chosen twice: the first time it is rewarded ($R = 1$), the second time it is not ($R = 0$). What is the value after both updates? Work it out by hand (or in a code cell) and enter the number.
+
+# %% [exercise 3.2]
+answer = None   # <- your number
+check("3.2", answer)
+
+# %% [markdown]
+### ✏️ Exercise 3.3 — Extreme learning rates *(conceptual)*
+
+With a learning rate of $\alpha = 1$, the value after each trial equals ...
+
+**(a)** the average of all rewards received so far
+**(b)** the most recent reward
+**(c)** the initial value, forever
+**(d)** the sum of all rewards received so far
+
+# %% [exercise 3.3]
+check("3.3", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 3.3 What the learning rate really is: a window on the past
+
+The update looks like it only involves the last reward, but unroll it once:
+
+$$
+V_{t+1} = (1-\alpha)\,V_t + \alpha R_t
+$$
+
+so the new value is a weighted average of the old value and the new reward. Substitute the same expression for $V_t$, then for $V_{t-1}$, and so on:
+
+$$
+V_{t+1} = \alpha R_t + \alpha(1-\alpha) R_{t-1} + \alpha(1-\alpha)^2 R_{t-2} + \dots + (1-\alpha)^{t} V_1 .
+$$
+
+The value is an **exponentially weighted average of past rewards**: the most recent reward has weight $\alpha$, the one before $\alpha(1-\alpha)$, and the weights decay geometrically. The initial value $V_1$ is forgotten at the same rate. A useful rule of thumb is that the agent "remembers" roughly the last $1/\alpha$ outcomes.
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 3.6))
+k = np.arange(0, 20)                                # k = 0 is the most recent outcome
+for alpha in [0.05, 0.2, 0.5]:
+    weights = alpha * (1 - alpha) ** k
+    ax.plot(k, weights, "o-", ms=4, label=f"α = {alpha}  (memory ≈ {1/alpha:.0f} trials)")
+ax.set(xlabel="how many trials ago the outcome occurred", ylabel="weight in the current value",
+       title="RW is an exponentially weighted average of past rewards")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+Compare this with the *optimal* estimator of a fixed reward probability from lesson 2: the running mean, which weights every past outcome equally and corresponds to a learning rate $\alpha_t = 1/t$ that shrinks over trials. A **constant** learning rate deliberately forgets, which is wasteful if the world is stable but essential if it changes. Lessons 11 and 12 show learners that adjust their learning rate to how changeable the world appears to be.
+
+### ✏️ Exercise 3.4 — The weight of an old outcome *(maths)*
+
+With $\alpha = 0.3$, what weight does the current value give to the outcome that occurred **3 trials before the most recent one** (that is, the fourth most recent outcome)?
+
+# %% [exercise 3.4]
+answer = None   # <- your number (a decimal between 0 and 1)
+check("3.4", answer)
+
+# %% [markdown]
+## 3.4 From values to choices: the softmax rule
+
+Values are not behaviour. To predict (or simulate) *choices* we need a **choice rule** that maps values to probabilities. The most common is the **softmax** (also called the Boltzmann or Luce rule):
+
+$$
+P(\text{choose } a) = \frac{\exp(\beta\, Q(a))}{\sum_{a'} \exp(\beta\, Q(a'))}
+$$
+
+where $Q(a)$ is the value of option $a$ and $\beta \geq 0$ is the **inverse temperature**. With two options the rule becomes a logistic function of the value *difference*:
+
+$$
+P(A) = \frac{1}{1 + \exp\!\big(-\beta\,[Q(A) - Q(B)]\big)} .
+$$
+
+$\beta = 0$ gives random choices (every option with probability $1/k$); as $\beta \to \infty$ the agent always picks the highest value. Intermediate values let the agent mostly exploit what it believes is best while occasionally sampling the other options — which is how it can discover that its belief is wrong.
+
+# %%
+diff = np.linspace(-1, 1, 200)
+fig, ax = plt.subplots(figsize=(7, 3.6))
+for beta in [1, 3, 10, 50]:
+    ax.plot(diff, 1 / (1 + np.exp(-beta * diff)), label=f"β = {beta}")
+ax.set(xlabel="value difference  Q(A) − Q(B)", ylabel="P(choose A)", title="The softmax rule for two options")
+ax.axhline(0.5, color="#52514e", lw=0.8, ls=":"); ax.axvline(0, color="#52514e", lw=0.8, ls=":")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+**A numerical trap.** Computing $\exp(\beta Q)$ directly overflows when $\beta Q$ is large ($e^{1000}$ is infinity in floating point, and $\infty/\infty$ is `nan`). Because the softmax only depends on *differences*, you can subtract the largest value from all of them before exponentiating without changing the result — the standard trick, and the one you should always use.
+
+### ✏️ Exercise 3.5 — A numerically stable softmax *(coding)*
+
+Implement the softmax for a vector of `values` and inverse temperature `beta`, returning an array of probabilities that sums to 1. Subtract the maximum before exponentiating. (The checker tests it on values like `[1000, 1001]`.)
+
+# %% [exercise 3.5]
+def softmax(values, beta=1.0):
+    """Softmax choice probabilities  p_i = exp(beta*v_i) / sum_j exp(beta*v_j)."""
+    x = beta * np.asarray(values, dtype=float)
+    x = ...                      # <- subtract the maximum (numerical stability)
+    e = ...                      # <- exponentiate
+    return ...                   # <- normalise so that the probabilities sum to 1
+
+check("3.5", softmax)
+
+# %% [markdown]
+### ✏️ Exercise 3.6 — Softmax by hand *(maths)*
+
+Two options have values $Q(A) = 0.6$ and $Q(B) = 0.4$, and $\beta = 5$. What is the probability of choosing A? Give three decimals.
+
+# %% [exercise 3.6]
+answer = None   # <- your number
+check("3.6", answer)
+
+# %% [markdown]
+### ✏️ Exercise 3.7 — What the inverse temperature does *(conceptual)*
+
+Increasing $\beta$ (keeping the values the same) makes the agent ...
+
+**(a)** choose more randomly, exploring more
+**(b)** choose the higher-valued option more consistently (exploit more)
+**(c)** learn faster from each reward
+**(d)** assign higher values to every option
+
+# %% [exercise 3.7]
+check("3.7", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 3.5 A complete agent
+
+We now have everything needed to simulate a learner that **plays** the bandit: on every trial it turns its values into probabilities (softmax), samples a choice, observes a reward, and updates the chosen option's value (RW). In pseudo-code:
+
+```
+initialise Q(a) = q0 for every option
+for t in 1..n_trials:
+    record Q                              # values before the choice (we will need them in lesson 5)
+    p = softmax(Q, beta)
+    choice ~ p                            # sample an option
+    reward ~ Bernoulli(probs[choice])     # the task responds
+    Q[choice] = rw_update(Q[choice], reward, alpha)
+```
+
+Sampling is done with `models.choose(p, rng)`, which draws an index with probabilities `p`.
+
+### ✏️ Exercise 3.8 — Simulate a complete RW + softmax agent *(coding)*
+
+Write the full simulation loop. Return a dictionary with the arrays `choices` (ints), `rewards` (floats) and `Q` — the values *before* each choice, shape `(n_trials, n_arms)`. Use `softmax` and `rw_update` from above (or `models.softmax` / `models.rw_update`), `models.choose` to sample the choice and `float(rng.random() < probs[c])` for the reward.
+
+The checker does not require the same random numbers as the reference: it checks that your `Q` history is consistent with your own choices and rewards, and that the agent learns to prefer the best option.
+
+# %%
+from rlcourse.models import choose     # choose(p, rng) samples an index with probabilities p
+print("example: ten draws with p = [0.9, 0.1]:", [choose([0.9, 0.1], rng) for _ in range(10)])
+
+# %% [exercise 3.8]
+def simulate_rw_bandit(probs, alpha, beta, n_trials, rng, q0=0.5):
+    """Simulate a Rescorla–Wagner learner with softmax choices on a bandit.
+
+    Returns dict(choices=int array, rewards=float array, Q=array (n_trials, n_arms) of values before each choice).
+    """
+    probs = np.asarray(probs, dtype=float)
+    n_arms = len(probs)
+    Q = np.full(n_arms, q0, dtype=float)
+    choices = np.zeros(n_trials, dtype=int)
+    rewards = np.zeros(n_trials)
+    Q_history = np.zeros((n_trials, n_arms))
+    for t in range(n_trials):
+        raise NotImplementedError("your code here: record Q, choose, get a reward, update the chosen arm")
+    return {"choices": choices, "rewards": rewards, "Q": Q_history}
+
+check("3.8", simulate_rw_bandit)
+
+# %% [markdown]
+Let's look at one agent playing 200 trials on the 70/30 bandit.
+
+# %%
+simulate_rw_bandit = use("3.8", simulate_rw_bandit)
+
+sim = simulate_rw_bandit(probs=[0.7, 0.3], alpha=0.2, beta=5, n_trials=200, rng=rng)
+
+fig, axes = plt.subplots(2, 1, figsize=(8, 5.5), sharex=True, height_ratios=[2, 1])
+axes[0].plot(sim["Q"][:, 0], label="Q(A)  (true p = 0.7)")
+axes[0].plot(sim["Q"][:, 1], label="Q(B)  (true p = 0.3)")
+axes[0].set(ylabel="value", title="One RW + softmax agent on the two-armed bandit (α = 0.2, β = 5)")
+axes[0].legend(loc="lower right")
+rewarded = sim["rewards"] == 1
+axes[1].scatter(np.arange(200)[rewarded], sim["choices"][rewarded], s=12, label="rewarded")
+axes[1].scatter(np.arange(200)[~rewarded], sim["choices"][~rewarded], s=12, marker="x", color="#52514e", label="not rewarded")
+axes[1].set(yticks=[0, 1], yticklabels=["A", "B"], xlabel="trial", ylabel="choice")
+axes[1].legend(loc="center right")
+plt.show()
+print(f"chose A on {np.mean(sim['choices'] == 0):.0%} of trials; average reward {sim['rewards'].mean():.2f}")
+
+# %% [markdown]
+### How α and β shape behaviour
+
+A single run is noisy. The standard way to see what a parameter *does* is to simulate many agents and average their **learning curves** — here, the probability of choosing the better option on each trial. This is also the first step of a modelling project (Wilson & Collins, 2019): before fitting anything, simulate the model to check that the parameters have distinguishable effects on behaviour.
+
+# %%
+def learning_curve(alpha, beta, n_agents=200, n_trials=100, probs=(0.7, 0.3)):
+    """P(choose the best option) on each trial, averaged over simulated agents."""
+    best = int(np.argmax(probs))
+    curves = np.zeros((n_agents, n_trials))
+    for i in range(n_agents):
+        sim = simulate_rw_bandit(probs, alpha, beta, n_trials, rng)
+        curves[i] = sim["choices"] == best
+    return curves.mean(axis=0)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+for alpha in [0.02, 0.1, 0.3, 0.9]:
+    axes[0].plot(learning_curve(alpha, beta=5), label=f"α = {alpha}")
+axes[0].set(title="Effect of the learning rate (β = 5)", xlabel="trial", ylabel="P(choose best option)")
+axes[0].legend()
+for beta in [0.5, 2, 5, 20]:
+    axes[1].plot(learning_curve(alpha=0.2, beta=beta), label=f"β = {beta}")
+axes[1].set(title="Effect of the inverse temperature (α = 0.2)", xlabel="trial")
+axes[1].legend()
+for ax in axes:
+    ax.axhline(0.5, color="#52514e", lw=0.8, ls=":")
+plt.show()
+
+# %% [markdown]
+Read the two panels carefully:
+
+- **Learning rate.** A tiny $\alpha$ learns slowly. A moderate $\alpha$ learns quickly and then performs well. A very large $\alpha$ learns quickly but performs *worse* afterwards, because one unlucky outcome is enough to make the good option look bad (see Exercise 3.10).
+- **Inverse temperature.** A small $\beta$ never performs well even when the values are right, because choices stay random. A large $\beta$ exploits strongly — good here, but it leaves the agent unable to recover if it happens to start by preferring the wrong option.
+
+These two parameters are the ones most often fitted to human data, and their effects overlap in ways that can be hard to disentangle — which is why lessons 6 and 14 spend time on parameter recovery and interpretation.
+
+## 3.6 An alternative choice rule: ε-greedy
+
+The softmax is not the only way to explore. In **ε-greedy** choice the agent picks the highest-valued option with probability $1-\varepsilon$ and otherwise chooses uniformly at random among *all* options (so the best option also gets its share $\varepsilon/k$). It is common in machine learning (Sutton & Barto, 2018) and sometimes fitted to behaviour.
+
+### ✏️ Exercise 3.9 — Epsilon-greedy choice probabilities *(coding)*
+
+Return the choice probabilities of an ε-greedy policy. If several options tie for the highest value, they share the greedy probability $1-\varepsilon$ equally.
+
+# %% [exercise 3.9]
+def epsilon_greedy_probs(values, epsilon):
+    """Choice probabilities of an epsilon-greedy policy (ties share the greedy mass)."""
+    values = np.asarray(values, dtype=float)
+    k = len(values)
+    best = values == values.max()          # boolean array: which options are (jointly) best
+    probs = ...                            # <- every option gets its share of the random choices
+    probs[best] += ...                     # <- the best option(s) share the greedy probability
+    return probs
+
+check("3.9", epsilon_greedy_probs)
+
+# %%
+epsilon_greedy_probs = use("3.9", epsilon_greedy_probs)
+Q_example = np.array([0.6, 0.4, 0.55])
+print("softmax (β = 5):    ", np.round(models.softmax(Q_example, 5), 3))
+print("ε-greedy (ε = 0.1): ", np.round(epsilon_greedy_probs(Q_example, 0.1), 3))
+
+# %% [markdown]
+The softmax gives the *nearly-as-good* third option a decent share of the choices, ε-greedy treats it exactly like the clearly bad one. Which is "right" for humans is an empirical question — and exactly the kind of question lessons 5–7 teach you to answer by fitting both and comparing them.
+
+## 3.7 Stability versus flexibility: the reversal task
+
+So far the bandit was stationary. In a **reversal learning** task the contingencies swap at some point: the 70% option becomes the 30% option and vice versa. Such tasks are everywhere in clinical research because adapting to change is exactly what many patient groups find hard.
+
+Below we simulate agents with three learning rates on a task with a reversal at trial 100, and plot the probability of choosing the currently-best option. The simulation loop is written out in full so that you can see how to adapt the one from Exercise 3.8 to a task object that changes over time.
+
+# %%
+def simulate_on_task(task, alpha, beta, rng, q0=0.5):
+    """RW + softmax agent on any task with a .step(action) -> (reward, ...) interface."""
+    Q = np.full(2, q0)
+    choices = np.zeros(task.n_trials, int)
+    for t in range(task.n_trials):
+        c = models.choose(models.softmax(Q, beta), rng)
+        r, _ = task.step(c)
+        Q[c] = rw_update(Q[c], r, alpha)
+        choices[t] = c
+    return choices
+
+n_agents, n_trials = 300, 200
+fig, ax = plt.subplots(figsize=(8, 4))
+for alpha in [0.05, 0.2, 0.6]:
+    correct = np.zeros((n_agents, n_trials))
+    for i in range(n_agents):
+        task = tasks.ReversalTask.from_reversals(n_trials, reversal_points=[100], p_good=0.7, rng=rng,
+                                                 full_information=False)
+        choices = simulate_on_task(task, alpha, beta=5, rng=rng)
+        best_option = (task.schedule < 0.5).astype(int)      # option 0 is best while P(option 0 pays) > 0.5
+        correct[i] = choices == best_option
+    ax.plot(correct.mean(axis=0), label=f"α = {alpha}")
+ax.axvline(100, color="#52514e", ls="--", lw=1)
+ax.text(101, 0.3, "reversal", color="#52514e")
+ax.set(xlabel="trial", ylabel="P(choose currently-best option)", title="Learning rate trades stability for flexibility (β = 5)")
+ax.legend()
+plt.show()
+
+# %% [markdown]
+Before the reversal the low-$\alpha$ agent is the best; after it, the high-$\alpha$ agent recovers fastest. Neither is right in general. This tension is the motivation for an entire family of models (lessons 11–12) in which the learning rate itself is adjusted to how volatile the environment seems — and for a line of clinical work (Browning et al., 2015; Gagne et al., 2020) asking whether anxiety disrupts that adjustment.
+
+### ✏️ Exercise 3.10 — Stability versus flexibility *(conceptual, written)*
+
+In 2–4 sentences: why does a high learning rate hurt in a stable but noisy environment, and why does it help right after a reversal? Write your answer in the string below. The checker looks for the key ideas and then shows a model answer to compare with.
+
+# %% [exercise 3.10]
+check("3.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- The **Rescorla–Wagner rule** $V \leftarrow V + \alpha (R - V)$ updates a value in proportion to the **reward prediction error**; only the chosen option is updated.
+- The **learning rate** $\alpha$ makes the value an exponentially weighted average of past rewards with a memory of roughly $1/\alpha$ trials: large $\alpha$ = fast but noisy, small $\alpha$ = slow but stable.
+- The **softmax** rule turns values into choice probabilities; the **inverse temperature** $\beta$ sets how deterministic choices are. Always implement it with the max-subtraction trick.
+- A full agent alternates *choose → observe → update*; simulating many agents shows what each parameter does to behaviour, which is the first step of any modelling project.
+- There is no universally good learning rate: it should depend on how noisy and how changeable the environment is.
+
+## What's next
+
+Lesson 4 extends the delta rule across time: **temporal-difference learning** lets an agent learn about outcomes that are several steps away, and explains the famous dopamine recordings. Lesson 5 then turns the simulation of this lesson around: given a participant's choices, which $\alpha$ and $\beta$ were most likely to have produced them?
+
+## References
+
+- Rescorla, R. A., & Wagner, A. R. (1972). A theory of Pavlovian conditioning: Variations in the effectiveness of reinforcement and nonreinforcement. In A. H. Black & W. F. Prokasy (Eds.), *Classical Conditioning II: Current Research and Theory* (pp. 64–99). Appleton-Century-Crofts.
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.), chapter 2 (multi-armed bandits). MIT Press. http://incompleteideas.net/book/the-book-2nd.html
+- Schultz, W., Dayan, P., & Montague, P. R. (1997). A neural substrate of prediction and reward. *Science, 275*(5306), 1593–1599. https://doi.org/10.1126/science.275.5306.1593
+- Niv, Y. (2009). Reinforcement learning in the brain. *Journal of Mathematical Psychology, 53*(3), 139–154. https://doi.org/10.1016/j.jmp.2008.12.005
+- Daw, N. D. (2011). Trial-by-trial data analysis using computational models. In M. R. Delgado, E. A. Phelps & T. W. Robbins (Eds.), *Decision Making, Affect, and Learning: Attention and Performance XXIII* (pp. 3–38). Oxford University Press.
+- Wilson, R. C., & Collins, A. G. E. (2019). Ten simple rules for the computational modeling of behavioral data. *eLife, 8*, e49547. https://doi.org/10.7554/eLife.49547
+- Browning, M., Behrens, T. E., Jocham, G., O'Reilly, J. X., & Bishop, S. J. (2015). Anxious individuals have difficulty learning the causal statistics of aversive environments. *Nature Neuroscience, 18*, 590–596. https://doi.org/10.1038/nn.3961
+- Gagne, C., Zika, O., Dayan, P., & Bishop, S. J. (2020). Impaired adaptation of learning to contingency volatility in internalizing psychopathology. *eLife, 9*, e61387. https://doi.org/10.7554/eLife.61387

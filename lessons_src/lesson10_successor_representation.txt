@@ -1,0 +1,439 @@
+# %% [markdown]
+# Lesson 10 — The successor representation
+
+Lesson 9 drew a sharp line: model-free learners cache *values*, model-based learners store a *model* and plan. The **successor representation** (SR) blurs that line in an illuminating way. It caches *predictions about which states you will visit* — a long-run forecast rather than a one-step model — and combines them with a separately learned map of rewards. The result is a learner that is as cheap as a habit at decision time, adapts instantly to some changes in the world (new rewards) and not at all to others (new transitions). That precise pattern of flexibility and inflexibility is testable, and it has made the SR one of the most productive ideas in recent cognitive neuroscience.
+
+**What you will learn**
+
+- what the SR is, how it factorises value into *where will I be* × *what is each place worth*, and the closed form $M = (I - \gamma T)^{-1}$,
+- how the SR is learned by temporal-difference prediction errors, exactly like a value function,
+- how reward and transition **revaluation** experiments dissociate model-free, SR and model-based agents, and what humans do,
+- why the SR is policy-dependent, and what that implies.
+
+**Prerequisites:** lessons 4 and 9 (TD learning, model-based control).
+
+**Estimated time:** 2 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 10.1 Between model-free and model-based: predicting states instead of values
+
+Write the value of a state as the expected discounted sum of the rewards of the states you will occupy, with rewards attached to states (this is the convention of the SR literature; it differs from lesson 9's "reward on entering" by a factor $\gamma$ for states with no reward of their own, which never changes which option is preferred):
+
+$$
+V(s) = \mathbb{E}\Big[\sum_{k \ge 0} \gamma^k R(s_k) \,\Big|\, s_0 = s\Big].
+$$
+
+Dayan (1993) noticed that this sum can be split into two parts. Define the **successor representation**
+
+$$
+M(s, s') = \mathbb{E}\Big[\sum_{k \ge 0} \gamma^k\, \mathbb{1}(s_k = s') \,\Big|\, s_0 = s\Big],
+$$
+
+the expected discounted number of future visits to $s'$ when starting from $s$ (the current state counts as a visit at $k = 0$). Then, because the reward at any time depends only on which state is occupied,
+
+$$
+V(s) = \sum_{s'} M(s, s')\, R(s') \qquad\text{or in matrix form}\qquad V = M R .
+$$
+
+Value = (where will I be) × (what is each place worth). The two factors can be learned separately, and either can change without touching the other. Under a fixed policy the state-to-state transition matrix $T$ (with $T(s, s') = \sum_a \pi(a \mid s) P(s' \mid s, a)$) determines $M$ exactly:
+
+$$
+M = I + \gamma T + \gamma^2 T^2 + \dots = (I - \gamma T)^{-1},
+$$
+
+the matrix version of $1 + x + x^2 + \dots = 1/(1-x)$. In the episodic tasks of this course terminal states have an all-zero row of $T$ (nothing follows them), so their SR row is just their own one-hot vector.
+
+### ✏️ Exercise 10.1 — The SR of a known transition matrix *(coding)*
+
+Return $M = (I - \gamma T)^{-1}$ for a state-to-state transition matrix `T`.
+
+# %% [exercise 10.1]
+def sr_analytic(T, gamma):
+    """The successor representation of a transition matrix:  M = (I - gamma T)^-1."""
+    n = T.shape[0]
+    return ...
+
+check("10.1", sr_analytic)
+
+# %% [markdown]
+Let's look at the SR of two tasks from earlier lessons. `mdp.transition_matrix()` returns $T$ under the uniform random policy (with zero rows for terminal states).
+
+# %%
+sr_analytic = use("10.1", sr_analytic)
+gamma = 0.9
+
+chain = tasks.random_walk_chain(n_states=5)          # L - A - B - C - D - E - R (lesson 4); R pays 1
+branch = tasks.three_branch_graph()                  # start -> 3 intermediate -> 3 terminal states (end-B pays 10)
+M_chain = sr_analytic(chain.transition_matrix(), gamma)
+M_branch = sr_analytic(branch.transition_matrix(), gamma)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+plotting.plot_matrix(M_chain, chain.names, ax=axes[0], title="SR of the random-walk chain (random policy, γ = 0.9)")
+plotting.plot_matrix(M_branch, branch.names, ax=axes[1], title="SR of the three-branch graph (random policy, γ = 0.9)")
+plt.show()
+
+# %% [markdown]
+Read a row as *the future seen from that state*: from C in the chain the agent expects to spend time in B and D, less in A and E, and to end up in L or R with equal probability; from the start of the branch graph it expects each intermediate and terminal state about equally (it chooses at random). Every row of a terminal state is a one-hot vector.
+
+Multiplying by the rewards gives values. With $\gamma = 1$ the chain's values are the exact ones Sutton and Barto (2018, Example 6.2) list for TD learning, $1/6, 2/6, \dots, 5/6$:
+
+# %%
+M_chain_undiscounted = sr_analytic(chain.transition_matrix(), gamma=1.0)
+V_chain = models.sr_value(M_chain_undiscounted, chain.R)
+print("state:", chain.names)
+print("V = M R:", np.round(V_chain, 3))
+print("true values (Sutton & Barto, Example 6.2):", np.round(np.arange(1, 6) / 6, 3), "for A..E")
+
+# %% [markdown]
+### ✏️ Exercise 10.2 — An SR entry by hand *(maths)*
+
+A tiny deterministic chain has three states: $s_0 \to s_1 \to s_2$, with $s_2$ terminal. With $\gamma = 0.9$, what is $M(s_0, s_2)$?
+
+# %% [exercise 10.2]
+answer = None   # <- your number
+check("10.2", answer)
+
+# %% [markdown]
+## 10.2 Learning the SR by temporal-difference updates
+
+The closed form needs $T$. A learner that only experiences transitions can nevertheless learn $M$, because $M$ satisfies a Bellman-like recursion:
+
+$$
+M(s, \cdot) = \mathbb{1}(s) + \gamma \sum_{s'} T(s, s')\, M(s', \cdot),
+$$
+
+"the future from $s$ is: being in $s$ now, plus the discounted future from wherever I go next". Replace the expectation over $s'$ by the state actually reached and you get a **TD update of a whole row** (Dayan, 1993):
+
+$$
+M(s, \cdot) \leftarrow M(s, \cdot) + \alpha\,\big[\,\mathbb{1}(s) + \gamma M(s_{t+1}, \cdot) - M(s, \cdot)\,\big].
+$$
+
+It is lesson 4's TD(0) with a one-hot vector in place of the reward: the SR is a bundle of value functions, one per "reward of being in $s'$". The reward map $R$ is learned by the plain delta rule of lesson 3, one entry at a time.
+
+### ✏️ Exercise 10.3 — Learning the SR by TD *(coding)*
+
+Update the row of the state that was just left, after a transition `s → s_next`. Work on a copy of `M` and return it. (Terminal states keep their one-hot rows automatically, because no transition ever leaves them.)
+
+# %% [exercise 10.3]
+def sr_td_update(M, s, s_next, alpha, gamma):
+    """TD update of one row of the successor matrix after a transition s -> s_next."""
+    M = np.array(M, dtype=float)
+    onehot = np.zeros(M.shape[0])
+    onehot[s] = 1.0
+    target = ...                                 # <- what the row should look like given this transition
+    M[s] = ...                                   # <- move the row a fraction alpha towards the target
+    return M
+
+check("10.3", sr_td_update)
+
+# %% [markdown]
+### ✏️ Exercise 10.4 — Learning the reward of each state *(coding)*
+
+Delta-rule update of the estimated reward of state `s` after receiving reward `r` there. Work on a copy and return it.
+
+# %% [exercise 10.4]
+def sr_reward_update(R_hat, s, r, alpha):
+    """Delta-rule learning of the reward expected in each state."""
+    R_hat = np.array(R_hat, dtype=float)
+    R_hat[s] = ...
+    return R_hat
+
+check("10.4", sr_reward_update)
+
+# %% [markdown]
+Let an agent wander the chain at random for 300 episodes, learning $M$ and $R$ from nothing ($M$ starts as the identity: "I am where I am"). The learned matrix converges to the analytic one.
+
+# %%
+sr_td_update = use("10.3", sr_td_update)
+sr_reward_update = use("10.4", sr_reward_update)
+
+alpha = 0.1
+M = np.eye(chain.n_states)
+R_hat = np.zeros(chain.n_states)
+errors = []
+for episode in range(300):
+    s = chain.reset(rng)
+    done = False
+    while not done:
+        a = int(rng.integers(2))                          # random policy: left or right
+        s_next, r, done = chain.step(a, rng)
+        M = sr_td_update(M, s, s_next, alpha, gamma)
+        R_hat = sr_reward_update(R_hat, s_next, r, alpha)
+        s = s_next
+    errors.append(np.abs(M - M_chain).max())
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), width_ratios=[1.2, 1, 1])
+axes[0].plot(errors, color=plotting.SYSTEM_COLORS["SR"])
+axes[0].set(xlabel="episode", ylabel="max |M_learned − M_true|", title="The SR converges by TD learning")
+plotting.plot_matrix(M, chain.names, ax=axes[1], title="learned by TD (300 episodes)", vmin=0, vmax=M_chain.max())
+plotting.plot_matrix(M_chain, chain.names, ax=axes[2], title="analytic (I − γT)⁻¹", vmin=0, vmax=M_chain.max())
+plt.show()
+print("learned reward map R_hat:", np.round(R_hat, 2))
+
+# %% [markdown]
+## 10.3 Revaluation: what each kind of learner can and cannot adapt to
+
+Why does the factorisation matter? Because it predicts a specific profile of flexibility. Momennejad et al. (2017) designed experiments to test it. Participants learned sequences of states leading to rewards, then experienced a *change* — of the rewards, or of the transitions — in a way that only touched part of the sequence, and were finally asked to choose between the sequences' starting points. The logic:
+
+- **Reward revaluation.** The rewards at the end states change; the participant sees only the end states with their new rewards. A model-based agent updates $R$ and re-plans: correct. An SR agent updates $R$ and recomputes $V = MR$: correct. A model-free agent has cached values for the starting states that nothing in this experience touches: wrong.
+- **Transition revaluation.** The *second-stage* states now lead to different end states; the participant experiences only those second-stage transitions. A model-based agent updates its model and re-plans from the start: correct. An SR agent updates the SR rows of the second-stage states, but the rows of the *starting* states — the ones it needs at test — still predict the old end states: wrong. Model-free: wrong.
+
+We will build the task and three agents and watch this happen. The task has three chains, $A_1 \to A_2 \to A_3$, $B_1 \to B_2 \to B_3$, $C_1 \to C_2 \to C_3$; at test the agent chooses which first-stage state to enter. Rewards are attached to the terminal states.
+
+# %%
+names = ["A1", "B1", "C1", "A2", "B2", "C2", "A3", "B3", "C3"]
+
+def three_chains(rewards=(0, 10, 0), swap=False):
+    """Three two-step chains X1 -> X2 -> X3 (terminal).  With swap=True, A2 leads to B3 and B2 to A3."""
+    P = np.zeros((9, 1, 9))                               # one action per state: the chains are deterministic
+    for i in range(3):
+        P[i, 0, i + 3] = 1.0                              # first stage -> second stage
+    ends = [7, 6, 8] if swap else [6, 7, 8]
+    for i, end in enumerate(ends):
+        P[i + 3, 0, end] = 1.0                            # second stage -> terminal
+    for end in (6, 7, 8):
+        P[end, 0, end] = 1.0                              # terminal states are absorbing
+    R = np.zeros(9)
+    R[6:9] = rewards
+    terminal = np.zeros(9, bool)
+    terminal[6:9] = True
+    return tasks.MDP(P, R, terminal, start=(0, 1, 2), names=names)
+
+mdp = three_chains()
+plotting.plot_matrix(mdp.transition_matrix(), names, title="State-to-state transitions T of the three-chain task")
+plt.show()
+
+# %% [markdown]
+The model-based agent needs a planner that works from a *learned* state-to-state model $\hat T$ and reward map $\hat R$. With rewards attached to states, policy evaluation through the model is the iteration $V \leftarrow \hat R + \gamma \hat T V$, whose fixed point is $(I - \gamma \hat T)^{-1} \hat R$ — the same number the SR agent gets from $M \hat R$ **as long as** $\hat T$ and $M$ describe the same world. The difference between the agents is not the arithmetic but *what is cached*: the planner caches $\hat T$ (one step) and recomputes, the SR agent caches $M$ (the long-run consequences) and multiplies.
+
+### ✏️ Exercise 10.5 — Model-based values from a learned model *(coding)*
+
+Iterate $V \leftarrow \hat R + \gamma \hat T V$ from $V = 0$ for `n_iter` sweeps and return $V$.
+
+# %% [exercise 10.5]
+def mb_values_from_model(T_hat, R_hat, gamma, n_iter=200):
+    """Model-based values from a learned state-to-state model: iterate V <- R + gamma T V."""
+    T_hat = np.asarray(T_hat, dtype=float)
+    R_hat = np.asarray(R_hat, dtype=float)
+    V = np.zeros(len(R_hat))
+    for _ in range(n_iter):
+        V = ...                                  # <- one more step of look-ahead through the model
+    return V
+
+check("10.5", mb_values_from_model)
+
+# %% [markdown]
+Now the three agents. They share every experience; each learns in its own way:
+
+- **MF**: TD(0) state values (lesson 4), `models.td0_update`.
+- **SR**: the successor matrix and the reward map, with your functions from Exercises 10.3–10.4.
+- **MB**: a transition model learned by a *state prediction error* (Gläscher et al., 2010) — the row $\hat T(s, \cdot)$ moves towards the one-hot vector of the observed successor — plus the same reward map; it plans with `mb_values_from_model` whenever it has to choose.
+
+# %%
+import copy
+mb_values_from_model = use("10.5", mb_values_from_model)
+
+class ThreeAgents:
+    """A model-free (TD), a successor-representation and a model-based learner that share every experience."""
+
+    def __init__(self, alpha=0.3, gamma=0.9, n_states=9):
+        self.alpha, self.gamma = alpha, gamma
+        self.V_mf = np.zeros(n_states)                    # MF: cached state values
+        self.M = np.eye(n_states)                         # SR: successor matrix
+        self.R_sr = np.zeros(n_states)                    # SR: reward map
+        self.T_hat = np.zeros((n_states, n_states))       # MB: learned one-step transition model
+        self.R_mb = np.zeros(n_states)                    # MB: reward map
+
+    def learn_transition(self, s, s_next, r, done):
+        """Experience the transition s -> s_next, receiving reward r in s_next."""
+        a, g = self.alpha, self.gamma
+        self.V_mf = models.td0_update(self.V_mf, s, r, s_next, a, g, done)
+        self.M = sr_td_update(self.M, s, s_next, a, g)
+        self.R_sr = sr_reward_update(self.R_sr, s_next, r, a)
+        observed = np.zeros(len(self.R_mb)); observed[s_next] = 1.0
+        self.T_hat[s] = self.T_hat[s] + a * (observed - self.T_hat[s])     # state prediction error
+        self.R_mb = sr_reward_update(self.R_mb, s_next, r, a)
+
+    def learn_reward_only(self, s, r):
+        """Be placed in state s and receive its reward (no transition into it is experienced)."""
+        self.R_sr = sr_reward_update(self.R_sr, s, r, self.alpha)
+        self.R_mb = sr_reward_update(self.R_mb, s, r, self.alpha)
+        # the model-free learner has no transition to assign credit to: nothing changes
+
+    def first_stage_values(self):
+        """What each agent believes the three first-stage states are worth (its basis for choosing)."""
+        return {"MF": self.V_mf[:3].copy(),
+                "SR": models.sr_value(self.M, self.R_sr)[:3],
+                "MB": mb_values_from_model(self.T_hat, self.R_mb, self.gamma)[:3]}
+
+def run_phase(agents, mdp, n_episodes, rng):
+    """Forced visits: episode k starts in first-stage state k % 3 and runs to the terminal state."""
+    for episode in range(n_episodes):
+        s = episode % 3
+        done = False
+        while not done:
+            mdp.state = s
+            s_next, r, done = mdp.step(0, rng)
+            agents.learn_transition(s, s_next, r, done)
+            s = s_next
+
+# %% [markdown]
+**Phase 1 — latent learning.** No rewards anywhere; the agents explore all three chains. **Phase 2 — reward learning.** $B_3$ now pays 10. After this, every agent should prefer $B_1$.
+
+# %%
+agents = ThreeAgents(alpha=0.3, gamma=0.9)
+run_phase(agents, three_chains(rewards=(0, 0, 0)), n_episodes=60, rng=rng)      # phase 1: latent learning
+run_phase(agents, three_chains(rewards=(0, 10, 0)), n_episodes=60, rng=rng)     # phase 2: B3 pays 10
+values_learning = agents.first_stage_values()
+for name, v in values_learning.items():
+    print(f"{name}: values of A1, B1, C1 = {np.round(v, 2)}  ->  prefers {names[int(np.argmax(v))]}")
+
+# %% [markdown]
+**Phase 3a — reward revaluation.** Starting from the agents as they are after phase 2, the rewards move: $B_3$ now pays 0 and $C_3$ pays 10. The agents are simply *placed* in each terminal state and receive its reward; they never travel there.
+
+**Phase 3b — transition revaluation.** Starting again from the agents after phase 2, the second stage is rewired: $A_2$ now leads to $B_3$ (which still pays 10) and $B_2$ to $A_3$. The agents are placed in the second-stage states and experience only the transitions from there. The correct first-stage choice is now $A_1$.
+
+# %%
+# 3a: reward revaluation
+agents_reward = copy.deepcopy(agents)
+new_rewards = {6: 0.0, 7: 0.0, 8: 10.0}                   # A3: 0, B3: 0, C3: 10
+for _ in range(15):
+    for s, r in new_rewards.items():
+        agents_reward.learn_reward_only(s, r)
+values_reward_reval = agents_reward.first_stage_values()
+
+# 3b: transition revaluation
+agents_transition = copy.deepcopy(agents)
+mdp_swapped = three_chains(rewards=(0, 10, 0), swap=True)
+for _ in range(15):
+    for s in (3, 4, 5):                                   # placed in A2, B2, C2
+        mdp_swapped.state = s
+        s_next, r, done = mdp_swapped.step(0, rng)
+        agents_transition.learn_transition(s, s_next, r, done)
+values_transition_reval = agents_transition.first_stage_values()
+
+phases = [("after reward learning", values_learning, 1),
+          ("after reward revaluation", values_reward_reval, 2),
+          ("after transition revaluation", values_transition_reval, 0)]
+fig, axes = plt.subplots(3, 3, figsize=(11, 7.6), sharey="row")
+for i, agent in enumerate(["MF", "SR", "MB"]):
+    for j, (title, vals, correct) in enumerate(phases):
+        ax = axes[i, j]
+        v = vals[agent]
+        bars = ax.bar(["A1", "B1", "C1"], v, color=plotting.SYSTEM_COLORS[agent], alpha=0.85)
+        bars[correct].set_edgecolor("#0b0b0b"); bars[correct].set_linewidth(2.5)
+        chosen = int(np.argmax(v))
+        ax.text(chosen, v[chosen], "chosen", ha="center", va="bottom", fontsize=9)
+        ax.grid(axis="x", visible=False)
+        if i == 0:
+            ax.set_title(title)
+        if j == 0:
+            ax.set_ylabel(f"{agent}: value of first-stage state")
+fig.suptitle("Black outline = correct option.  MF adapts to neither revaluation, SR only to the reward revaluation, MB to both", y=1.01)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+The pattern is exactly the one predicted. After the reward revaluation the SR agent switches to $C_1$ at once — its $M$ row for $C_1$ already "knew" that $C_1$ leads to $C_3$; only the price of $C_3$ changed. After the transition revaluation it is stuck on $B_1$: the row $M(B_1, \cdot)$ still predicts $B_3$, because the agent never left $B_1$ while the world was being rewired. Look for yourself:
+
+# %%
+print("M[B1, :] after the transition revaluation (still predicts B3, not A3):")
+print("   ", dict(zip(names, np.round(agents_transition.M[1], 2).tolist())))
+print("M[B2, :] after the transition revaluation (correctly predicts A3):")
+print("   ", dict(zip(names, np.round(agents_transition.M[4], 2).tolist())))
+
+# %% [markdown]
+### ✏️ Exercise 10.6 — A value after reward revaluation *(maths)*
+
+In the task above, $M(C_1, C_3) = \gamma^2 = 0.81$. Immediately after the reward revaluation the SR agent's reward map has $\hat R(C_3) = 10$ and 0 everywhere else. What is its value $V(C_1)$?
+
+# %% [exercise 10.6]
+answer = None   # <- your number
+check("10.6", answer)
+
+# %% [markdown]
+### ✏️ Exercise 10.7 — Who adapts to which revaluation? *(conceptual)*
+
+After the *transition* revaluation (second-stage states lead to different terminal states than before, experienced only from the second-stage states), which agents choose the correct first-stage state at test?
+
+**(a)** Only the model-based agent.
+**(b)** The model-based and the successor-representation agents.
+**(c)** All three agents.
+**(d)** Only the successor-representation agent.
+
+# %% [exercise 10.7]
+check("10.7", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+### What people do
+
+Momennejad et al. (2017) ran exactly these manipulations (plus a *policy* revaluation, in which the best second-stage choice changes). Human participants adapted well to reward revaluation and, crucially, *partly* to transition revaluation — better than a pure SR agent, worse than a pure planner, and with a characteristic pattern across the conditions that was best captured by a **hybrid of SR and model-based** evaluation. Russek et al. (2017) showed that an SR learner equipped with off-line replay of remembered transitions (**SR-Dyna**, after Sutton's 1990 Dyna architecture) can repair its stale rows between trials, reproducing much "model-based" behaviour — including the reward × transition interaction of the two-step task — without explicit planning. The SR thus offers a concrete mechanism for how cached predictions can masquerade as planning.
+
+### ✏️ Exercise 10.8 — The SR: a bit of both *(conceptual, written)*
+
+In 2–4 sentences: in what sense is the successor representation model-based-like, and in what sense is it model-free-like?
+
+# %% [exercise 10.8]
+check("10.8", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## 10.4 Policy dependence, and the SR in the brain
+
+$M$ is defined under a policy: $T$ in $(I - \gamma T)^{-1}$ is the state-to-state matrix *induced by how the agent behaves*. Change the policy and the SR changes — even though the maze is the same. Compare the chain's SR under the random policy with the SR of an agent that always moves right:
+
+# %%
+policy_right = np.tile([0.0, 1.0], (chain.n_states, 1))              # P(action | state): always "right"
+M_random = sr_analytic(chain.transition_matrix(), gamma)
+M_right = sr_analytic(chain.transition_matrix(policy_right), gamma)
+print("row of state C under the random policy: ", dict(zip(chain.names, np.round(M_random[3], 2).tolist())))
+print("row of state C under the always-right policy:", dict(zip(chain.names, np.round(M_right[3], 2).tolist())))
+
+# %% [markdown]
+This is what makes the SR cheap — it evaluates the *current* policy in one matrix–vector product — and what makes it fragile: after a change of policy (or of transitions) the cached predictions are stale until re-learned, exactly as model-free values are. It also means an SR learner *generalises* along the paths it has actually taken, which fits neural data surprisingly well. Stachenfeld, Botvinick and Gershman (2017) showed that hippocampal place cells behave like rows of an SR — they skew along habitual directions of travel and compress near barriers — and that grid cells resemble its eigenvectors; Gershman (2018) reviews the computational logic and the behavioural and neural evidence.
+
+### ✏️ Exercise 10.9 — Policy dependence *(conceptual)*
+
+An agent learned its SR while exploring a maze at random. It then starts choosing greedily. What is true of the SR rows it learned?
+
+**(a)** Nothing changes: the SR depends only on the transition structure of the maze.
+**(b)** They are now wrong for the new behaviour: the SR encodes expected future occupancies *under the policy that generated the experience*.
+**(c)** They are instantly recomputed, because the SR is a model.
+**(d)** They collapse to the identity matrix.
+
+# %% [exercise 10.9]
+check("10.9", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## Summary
+
+- The **successor representation** $M(s, s')$ is the expected discounted number of future visits to $s'$ from $s$; value factorises as $V = MR$. For a known policy, $M = (I - \gamma T)^{-1}$.
+- $M$ is learned by **TD updates of a whole row**, with a one-hot vector in place of the reward; the reward map $R$ is learned by the delta rule.
+- **Reward revaluation** is handled by the SR (update $R$, recompute $MR$) but not by model-free learning; **transition revaluation** is handled only by model-based planning, because the SR rows of the starting states cache the old consequences.
+- Humans are partly sensitive to transition revaluation: an SR–MB hybrid, or an SR with replay (SR-Dyna), fits best.
+- The SR is **policy-dependent**: cheap evaluation of the current policy, stale after a change of behaviour or structure; hippocampal place cells look like SR rows.
+
+## What's next
+
+Lessons 11 and 12 turn to a different question — not *what* is learned but *how fast*. Bayesian learners treat the learning rate as a quantity to be inferred from the uncertainty of the world, which leads to the Kalman filter, change-point detection and the volatile Kalman filter.
+
+## References
+
+- Dayan, P. (1993). Improving generalization for temporal difference learning: The successor representation. *Neural Computation, 5*(4), 613–624. https://doi.org/10.1162/neco.1993.5.4.613
+- Sutton, R. S. (1990). Integrated architectures for learning, planning, and reacting based on approximating dynamic programming. *Proceedings of the Seventh International Conference on Machine Learning*, 216–224.
+- Gläscher, J., Daw, N., Dayan, P., & O'Doherty, J. P. (2010). States versus rewards: Dissociable neural prediction error signals underlying model-based and model-free reinforcement learning. *Neuron, 66*(4), 585–595. https://doi.org/10.1016/j.neuron.2010.04.016
+- Momennejad, I., Russek, E. M., Cheong, J. H., Botvinick, M. M., Daw, N. D., & Gershman, S. J. (2017). The successor representation in human reinforcement learning. *Nature Human Behaviour, 1*, 680–692. https://doi.org/10.1038/s41562-017-0180-8
+- Russek, E. M., Momennejad, I., Botvinick, M. M., Gershman, S. J., & Daw, N. D. (2017). Predictive representations can link model-based reinforcement learning to model-free mechanisms. *PLoS Computational Biology, 13*(9), e1005768. https://doi.org/10.1371/journal.pcbi.1005768
+- Stachenfeld, K. L., Botvinick, M. M., & Gershman, S. J. (2017). The hippocampus as a predictive map. *Nature Neuroscience, 20*, 1643–1653. https://doi.org/10.1038/nn.4650
+- Gershman, S. J. (2018). The successor representation: Its computational logic and neural substrates. *Journal of Neuroscience, 38*(33), 7193–7200. https://doi.org/10.1523/JNEUROSCI.0151-18.2018
+- Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.), Example 6.2. MIT Press. http://incompleteideas.net/book/the-book-2nd.html

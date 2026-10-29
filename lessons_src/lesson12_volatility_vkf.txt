@@ -1,0 +1,524 @@
+# %% [markdown]
+# Lesson 12 — Bayesian learners II: volatility and the volatile Kalman filter
+
+Lesson 11 showed that a Bayesian learner's learning rate is not a free parameter but a *consequence* of uncertainty: the Kalman gain rises when the estimate is uncertain and falls as evidence accumulates. That filter, however, had to be *told* how fast the world changes (the process noise). Real environments do not come with that label. Sometimes the contingencies are stable for hundreds of trials; sometimes they flip every twenty. A learner that could **estimate how volatile the world is**, and adjust its learning rate accordingly, would do well in both — and Behrens et al. (2007) showed that people do exactly this.
+
+This lesson builds the **volatile Kalman filter (VKF)** of Piray and Daw (2020): a Kalman filter whose process noise is itself learned by a delta rule. It is simple enough to write in ten lines, principled enough to be derived from a generative model, and it has become a standard tool for studying learning in volatile environments — including in anxiety research, which lesson 14 takes up.
+
+**What you will learn**
+
+- the difference between *noise* and *volatility*, and why they call for opposite learning rates,
+- the continuous and the binary VKF, equation by equation (Piray & Daw, 2020, Eqs. 9–19),
+- how the VKF's learning rate and volatility signals behave in stable and volatile environments,
+- how to fit the VKF to choices, what recovers well and what does not,
+- how to measure learning-rate adaptation per participant, and how the VKF relates to the hierarchical Gaussian filter (HGF).
+
+**Prerequisites:** lessons 3, 5 and 11 (Rescorla–Wagner, maximum likelihood, Kalman filter).
+
+**Estimated time:** 2.5 hours.
+
+# %%
+import sys; sys.path.insert(0, "..")      # find the rlcourse package when running from notebooks/
+import numpy as np
+import matplotlib.pyplot as plt
+from rlcourse import check, hint, reveal, progress, use, setup_style
+from rlcourse import models, tasks, fitting, plotting
+setup_style()
+rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
+
+# %% [markdown]
+## 12.1 Two kinds of uncertainty
+
+Suppose you are tracking which of two options is currently the better one. An unexpected outcome can mean two very different things:
+
+- **Noise** (*expected uncertainty* in the terminology of Yu & Dayan, 2005): the better option simply failed to pay this time, as it does on 25% of trials. Nothing has changed, and the right response is to *average* over many trials — a low learning rate.
+- **Volatility** (*unexpected uncertainty*): the contingencies themselves have changed, so everything learned so far is out of date. The right response is to *forget* quickly — a high learning rate.
+
+Behrens, Woolrich, Walton and Rushworth (2007) built a task to separate the two. In a **stable** block the better option paid on 75% of trials and never changed; in a **volatile** block it still paid on 75% of trials, but the identity of the better option reversed every 25 trials or so. Participants learned faster in the volatile block, and activity in the anterior cingulate cortex tracked the volatility that an ideal Bayesian observer would estimate. The course package reproduces the design.
+
+# %%
+task = tasks.ReversalTask.stable_volatile(n_stable=120, n_volatile=120, block_len=25, p_good=0.75, rng=rng)
+outcomes = np.array([task.step(0)[1] for _ in range(task.n_trials)])   # 1 if option 0 was the rewarded option
+
+fig, ax = plt.subplots(figsize=(9, 3.4))
+ax.step(np.arange(task.n_trials), task.schedule, where="post", color="#52514e", lw=1.5, label="P(option 0 pays)  [hidden]")
+ax.plot(np.where(outcomes == 1)[0], np.full((outcomes == 1).sum(), 1.04), "|", color=plotting.PALETTE[0], label="option 0 paid")
+ax.plot(np.where(outcomes == 0)[0], np.full((outcomes == 0).sum(), -0.04), "|", color=plotting.PALETTE[1], label="option 1 paid")
+ax.axvspan(0, 120, color="#f0efec", alpha=0.6); ax.text(60, 0.5, "stable block", ha="center", color="#52514e")
+ax.text(180, 0.5, "volatile block", ha="center", color="#52514e")
+ax.set(xlabel="trial", ylabel="probability", ylim=(-0.1, 1.1), title="A stable/volatile reversal task (Behrens et al., 2007 design)")
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, fontsize=8)
+plt.show()
+
+# %% [markdown]
+In both blocks a quarter of the outcomes are "surprising". The learner's problem is to tell the two kinds of surprise apart using only the sequence of outcomes.
+
+To think about this precisely we need a **generative model** of volatility. The simplest one is a hidden quantity $z_t$ (here the tendency for option 0 to pay) that performs a random walk,
+
+$$
+z_t = z_{t-1} + \varepsilon_t, \qquad \varepsilon_t \sim \mathcal N(0, v_t),
+$$
+
+whose step variance $v_t$ — the **volatility** — is not fixed but changes slowly over time. Observations are noisy readings of $z_t$. Here is one realisation in which the volatility switches between a low and a high value; we will use it throughout the lesson.
+
+# %%
+n_trials = 450
+v_true = np.r_[np.full(150, 0.01), np.full(150, 4.0), np.full(150, 0.01)]        # volatility: low, high, low
+z_true = np.cumsum(rng.normal(0, np.sqrt(v_true)))                                 # the hidden random walk
+sigma2 = 0.25                                                                      # observation noise variance
+observations = z_true + rng.normal(0, np.sqrt(sigma2), n_trials)
+
+fig, axes = plt.subplots(2, 1, figsize=(9, 5), sharex=True, height_ratios=[2, 1])
+axes[0].plot(observations, ".", ms=3, color="#52514e", alpha=0.6, label="observations")
+axes[0].plot(z_true, color=plotting.PALETTE[1], label="hidden state z")
+axes[0].set(ylabel="value", title="A random walk whose volatility switches")
+axes[0].legend()
+axes[1].step(np.arange(n_trials), v_true, where="post", color=plotting.PALETTE[7])
+axes[1].set(xlabel="trial", ylabel="volatility v", yscale="log")
+plt.show()
+
+# %% [markdown]
+### ✏️ Exercise 12.1 — Noise or volatility? *(conceptual)*
+
+A reversal task has two blocks. In block 1 the better option pays on 75% of trials and never changes; in block 2 the better option still pays on 75% of trials but the identity of the better option switches every 25 trials. Which statement is correct?
+
+**(a)** The 25% unrewarded trials of block 1 are volatility: the environment is changing on those trials.
+**(b)** Block 1 has outcome noise but no volatility; block 2 has the same noise and, in addition, volatility.
+**(c)** Block 2 has less noise than block 1 because the reversals make outcomes more predictable.
+**(d)** Noise and volatility are the same quantity measured on different time scales.
+
+# %% [exercise 12.1]
+check("12.1", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 12.2 The continuous VKF: a Kalman filter that learns its own process noise
+
+Recall the Kalman filter of lesson 11, written in the notation of Piray and Daw (2020). The learner's belief about $z_t$ before seeing outcome $o_t$ is Gaussian with mean $m_{t-1}$ and variance $w_{t-1} + v$: the posterior variance from the previous trial plus the process noise $v$, because the state may have moved. The update is
+
+$$
+k_t = \frac{w_{t-1} + v}{w_{t-1} + v + \sigma^2}, \qquad
+m_t = m_{t-1} + k_t\,(o_t - m_{t-1}), \qquad
+w_t = (1 - k_t)\,(w_{t-1} + v),
+$$
+
+with $\sigma^2$ the observation noise. The **gain** $k_t$ is the learning rate: it is large when the prediction is uncertain relative to the observation, small otherwise. Note where the two kinds of uncertainty sit: volatility $v$ appears in the numerator and the denominator, noise $\sigma^2$ only in the denominator.
+
+### ✏️ Exercise 12.2 — The Kalman gain by hand *(maths)*
+
+A learner's posterior variance is $w = 0.6$, its volatility estimate is $v = 0.4$, and the observation noise is $\sigma^2 = 3$. What is the Kalman gain $k$?
+
+# %% [exercise 12.2]
+answer = None   # <- your number
+check("12.2", answer)
+
+# %% [markdown]
+### Learning the volatility
+
+The Kalman filter treats $v$ as known. The VKF's idea is to **estimate** it: after each update, the posterior over the pair $(z_t, z_{t-1})$ tells us how much the hidden state appears to have moved. The posterior expectation of the squared change is
+
+$$
+\mathbb E\big[(z_t - z_{t-1})^2\big] = (m_t - m_{t-1})^2 + w_t + w_{t-1} - 2\,w_{t,t-1},
+\qquad w_{t,t-1} = (1 - k_t)\, w_{t-1},
+$$
+
+where $w_{t,t-1}$ is the posterior covariance between the current and the previous state (Eq. 12). This quantity is an estimate of the volatility, and the VKF moves its volatility estimate towards it with a delta rule (Eq. 13):
+
+$$
+v_t = v_{t-1} + \lambda \Big[ (m_t - m_{t-1})^2 + w_t + w_{t-1} - 2\,w_{t,t-1} - v_{t-1} \Big].
+$$
+
+The new parameter $\lambda \in (0, 1)$ is the **volatility update rate** — the learning rate of the learning rate. With $\lambda = 0$ the filter is an ordinary Kalman filter with process noise $v_0$. The full algorithm (Piray & Daw, 2020, Eqs. 9–13; initial values $m = 0$, $w = \sigma^2$, $v = v_0$ as in the authors' code):
+
+| step | equation |
+|---|---|
+| gain (Eq. 9) | $k_t = (w_{t-1} + v_{t-1}) / (w_{t-1} + v_{t-1} + \sigma^2)$ |
+| mean (Eq. 10) | $m_t = m_{t-1} + k_t (o_t - m_{t-1})$ |
+| variance (Eq. 11) | $w_t = (1 - k_t)(w_{t-1} + v_{t-1})$ |
+| covariance (Eq. 12) | $w_{t,t-1} = (1 - k_t)\, w_{t-1}$ |
+| volatility (Eq. 13) | $v_t = v_{t-1} + \lambda\,[(m_t - m_{t-1})^2 + w_t + w_{t-1} - 2 w_{t,t-1} - v_{t-1}]$ |
+
+### ✏️ Exercise 12.3 — The continuous volatile Kalman filter *(coding)*
+
+Implement the five equations in a loop over outcomes. The function returns a dictionary of arrays holding, for every trial, the prediction `m`, the volatility `v` and the variance `w` *before* that trial's outcome is seen, plus the gain `k` and the prediction error `pe` used on that trial. Parameters: `lam` ($\lambda$), `v0` (initial volatility) and `sigma2` ($\sigma^2$).
+
+# %% [exercise 12.3]
+def vkf_continuous(outcomes, lam, v0, sigma2):
+    """Volatile Kalman filter for continuous outcomes (Piray & Daw 2020, Eqs. 9–13)."""
+    outcomes = np.asarray(outcomes, float)
+    n = len(outcomes)
+    m, w, v = 0.0, sigma2, v0                                   # initial mean, variance, volatility
+    out = {key: np.zeros(n) for key in ["m", "v", "k", "pe", "w"]}
+    for t, o in enumerate(outcomes):
+        out["m"][t], out["v"][t], out["w"][t] = m, v, w          # record the state *before* the outcome
+        m_prev, w_prev = m, w
+        k = ...                                                 # Eq. 9: the gain
+        pe = ...                                                # prediction error
+        m = ...                                                 # Eq. 10
+        w = ...                                                 # Eq. 11
+        w_cov = ...                                             # Eq. 12
+        v = ...                                                 # Eq. 13
+        out["k"][t], out["pe"][t] = k, pe
+    return out
+
+check("12.3", vkf_continuous)
+
+# %% [markdown]
+Let's run the VKF on the random walk from section 12.1, with the parameters Piray and Daw used in their simulations ($\lambda = 0.1$, $v_0 = 0.1$) and the true observation noise.
+
+# %%
+vkf_continuous = use("12.3", vkf_continuous)
+
+est = vkf_continuous(observations, lam=0.1, v0=0.1, sigma2=sigma2)
+
+fig, axes = plt.subplots(3, 1, figsize=(9, 7.5), sharex=True)
+axes[0].plot(observations, ".", ms=3, color="#52514e", alpha=0.5, label="observations")
+axes[0].plot(z_true, color=plotting.PALETTE[1], lw=1.5, label="hidden state")
+axes[0].plot(est["m"], color=plotting.PALETTE[0], lw=1.5, label="VKF prediction m")
+axes[0].set(ylabel="value", title="The continuous VKF tracks a random walk with changing volatility")
+axes[0].legend(loc="upper left")
+axes[1].step(np.arange(n_trials), v_true, where="post", color=plotting.PALETTE[7], label="true volatility")
+axes[1].plot(est["v"], color=plotting.PALETTE[0], label="estimated volatility v")
+axes[1].set(ylabel="volatility", yscale="log")
+axes[1].legend(loc="upper left")
+axes[2].plot(est["k"], color=plotting.PALETTE[0])
+axes[2].set(xlabel="trial", ylabel="gain k (learning rate)", ylim=(0, 1))
+plt.show()
+for lo, hi, label in [(50, 150, "low volatility"), (200, 300, "high volatility"), (350, 450, "low volatility again")]:
+    print(f"{label:22s}: mean estimated v = {est['v'][lo:hi].mean():5.2f}   mean gain k = {est['k'][lo:hi].mean():.2f}")
+
+# %% [markdown]
+The volatility estimate rises by an order of magnitude when the walk starts jumping and falls again when it calms down, and the gain follows: the learner updates almost completely from each observation in the volatile stretch and more conservatively otherwise.
+
+Two things deserve attention. First, the estimated volatility in the calm stretches does **not** go to zero, and the gain settles around 0.7 rather than near 0. The reason is in Eq. 13: the posterior expectation of the squared change contains the variance terms $w_t + w_{t-1} - 2 w_{t,t-1}$, which never vanish, so the VKF always expects some drift. (You can check this on a signal that does not move at all.) Second, how does learning the volatility compare with simply *knowing* it? Below, the VKF is pitted against ordinary Kalman filters ($\lambda = 0$) with fixed process noise.
+
+# %%
+flat = rng.normal(0, np.sqrt(sigma2), 1000)                      # a signal that never moves
+est_flat = vkf_continuous(flat, lam=0.1, v0=0.1, sigma2=sigma2)
+print(f"on a flat signal: final volatility estimate {est_flat['v'][-1]:.2f} (noise variance is {sigma2}), final gain {est_flat['k'][-1]:.2f}")
+
+print("\nmean absolute tracking error |m - z| on the switching-volatility walk:")
+print(f"  VKF (lam = 0.1, v0 = 0.1)         : {np.mean(np.abs(est['m'] - z_true)):.3f}")
+for v_fixed in [0.01, 0.1, 1.0, 4.0]:
+    kf = vkf_continuous(observations, lam=0.0, v0=v_fixed, sigma2=sigma2)       # lam = 0: ordinary Kalman filter
+    print(f"  Kalman filter with fixed v = {v_fixed:<5}: {np.mean(np.abs(kf['m'] - z_true)):.3f}")
+
+# %% [markdown]
+The VKF is about as good as the *best* fixed-volatility filter — without being told which volatility to assume — and better than filters that assume too much or too little change. That is the practical value of learning volatility: robustness across environments, which a fixed learning rate cannot offer (lesson 3, section 3.7).
+
+## 12.3 Binary outcomes: the binary VKF
+
+Most learning tasks have binary outcomes (reward or not; option 0 or option 1 paid). Piray and Daw (2020) derived a binary VKF in which the hidden state $m$ is the **logit** of the probability being tracked, so the prediction is $\sigma(m) = 1/(1 + e^{-m})$. Three things change relative to the continuous filter (Eqs. 14–19; initial values $m = 0$, $w = \omega$, $v = v_0$):
+
+| step | equation |
+|---|---|
+| prediction error (Eq. 14) | $\delta_t = o_t - \sigma(m_{t-1})$ — in probability space |
+| gain (Eq. 15) | $k_t = (w_{t-1} + v_{t-1}) / (w_{t-1} + v_{t-1} + \omega)$ |
+| learning rate (Eq. 16) | $\alpha_t = \sqrt{w_{t-1} + v_{t-1}}$ |
+| mean (Eq. 17) | $m_t = m_{t-1} + \alpha_t\, \delta_t$ |
+| variance, covariance, volatility (Eqs. 18–19) | as in the continuous case, with $k_t$ |
+
+The learning rate is now $\alpha_t = \sqrt{w + v}$ — the standard deviation of the predictive distribution of the logit — rather than the gain; the gain is used only to shrink the variance. The parameter $\omega$ plays the role of the observation noise $\sigma^2$.
+
+### ✏️ Exercise 12.4 — The binary volatile Kalman filter *(coding)*
+
+Implement the binary VKF. Besides `m`, `v`, `w`, `k` and `pe`, return `pred` (the predicted probability $\sigma(m)$ before each outcome) and `alpha` (the learning rate used on each trial). `sigmoid` is provided.
+
+# %%
+from rlcourse.models import sigmoid          # sigmoid(x) = 1 / (1 + exp(-x))
+print("sigmoid(0) =", sigmoid(0.0), "  sigmoid(2) =", round(float(sigmoid(2.0)), 3))
+
+# %% [exercise 12.4]
+def vkf_bin(outcomes, lam, v0, omega):
+    """Binary volatile Kalman filter (Piray & Daw 2020, Eqs. 14–19)."""
+    outcomes = np.asarray(outcomes, float)
+    n = len(outcomes)
+    m, w, v = 0.0, omega, v0
+    out = {key: np.zeros(n) for key in ["m", "pred", "v", "alpha", "k", "pe", "w"]}
+    for t, o in enumerate(outcomes):
+        out["m"][t], out["v"][t], out["w"][t] = m, v, w
+        out["pred"][t] = ...                                    # predicted probability before the outcome
+        m_prev, w_prev = m, w
+        pe = ...                                                # Eq. 14: error in probability space
+        k = ...                                                 # Eq. 15: gain
+        alpha = ...                                             # Eq. 16: learning rate
+        m = ...                                                 # Eq. 17
+        w = ...                                                 # Eq. 18
+        w_cov = ...
+        v = ...                                                 # Eq. 19
+        out["alpha"][t], out["k"][t], out["pe"][t] = alpha, k, pe
+    return out
+
+check("12.4", vkf_bin)
+
+# %% [markdown]
+### ✏️ Exercise 12.5 — The first learning rate *(maths)*
+
+A binary VKF is initialised with $\omega = 0.3$ and $v_0 = 0.1$. What is its learning rate $\alpha_1$ on the very first trial? Give three decimals.
+
+# %% [exercise 12.5]
+answer = None   # <- your number
+check("12.5", answer)
+
+# %% [markdown]
+Now the binary VKF on the Behrens task from section 12.1, with the parameters of Piray and Daw's simulations ($\lambda = 0.1$, $v_0 = 0.1$, $\omega = 0.1$).
+
+# %%
+vkf_bin = use("12.4", vkf_bin)
+
+sig = vkf_bin(outcomes, lam=0.1, v0=0.1, omega=0.1)
+fig, axes = plt.subplots(2, 1, figsize=(9, 5.5), sharex=True)
+axes[0].step(np.arange(task.n_trials), task.schedule, where="post", color="#52514e", lw=1.2, label="P(option 0 pays)  [hidden]")
+axes[0].plot(sig["pred"], color=plotting.PALETTE[0], label="VKF prediction")
+axes[0].plot(np.where(outcomes == 1)[0], np.full((outcomes == 1).sum(), 1.04), "|", color="#52514e", alpha=0.5)
+axes[0].plot(np.where(outcomes == 0)[0], np.full((outcomes == 0).sum(), -0.04), "|", color="#52514e", alpha=0.5)
+axes[0].set(ylabel="probability", ylim=(-0.1, 1.1), title="Binary VKF on the stable/volatile task (λ = 0.1, v0 = 0.1, ω = 0.1)")
+axes[0].legend(loc="lower left", fontsize=8)
+axes[1].plot(sig["alpha"], color=plotting.PALETTE[0], label="learning rate α")
+axes[1].plot(sig["v"], color=plotting.PALETTE[7], label="volatility estimate v")
+axes[1].axvline(120, color="#52514e", ls="--", lw=1)
+axes[1].set(xlabel="trial", ylabel="value")
+axes[1].legend()
+plt.show()
+
+# %% [markdown]
+A single run is noisy, so let's average the learning rate over 50 realisations of the task and compare the blocks. We also ask how the block difference depends on the task: the same filter is run on designs with less outcome noise and more frequent reversals.
+
+# %%
+def mean_alpha_by_block(lam, v0, omega, p_good=0.75, block_len=25, n_tasks=50):
+    """Average learning rate in the 2nd half of the stable block and in the volatile block."""
+    a_stable, a_volatile, traces = [], [], []
+    for i in range(n_tasks):
+        t = tasks.ReversalTask.stable_volatile(p_good=p_good, block_len=block_len, rng=rng)
+        o = np.array([t.step(0)[1] for _ in range(t.n_trials)])
+        a = vkf_bin(o, lam, v0, omega)["alpha"]
+        a_stable.append(a[60:120].mean()); a_volatile.append(a[120:].mean()); traces.append(a)
+    return np.mean(a_stable), np.mean(a_volatile), np.mean(traces, axis=0)
+
+a_s, a_v, trace = mean_alpha_by_block(0.1, 0.1, 0.1)
+fig, ax = plt.subplots(figsize=(9, 3.4))
+ax.plot(trace, color=plotting.PALETTE[0])
+ax.axvline(120, color="#52514e", ls="--", lw=1)
+for r in range(145, 240, 25):
+    ax.axvline(r, color="#52514e", ls=":", lw=0.8)
+ax.set(xlabel="trial", ylabel="learning rate α", title="Learning rate of the binary VKF averaged over 50 tasks (dotted lines: reversals)")
+plt.show()
+print(f"Behrens design (75/25, reversal every 25): mean α stable = {a_s:.3f}, volatile = {a_v:.3f}  (ratio {a_v / a_s:.2f})")
+print("\nthe same filter on sharper designs:")
+for p_good, block_len in [(0.85, 20), (0.9, 15)]:
+    a_s2, a_v2, _ = mean_alpha_by_block(0.1, 0.1, 0.1, p_good=p_good, block_len=block_len, n_tasks=20)
+    print(f"  {int(p_good*100)}/{int(100-p_good*100)}, reversal every {block_len}: α stable = {a_s2:.3f}, volatile = {a_v2:.3f}  (ratio {a_v2 / a_s2:.2f})")
+
+# %% [markdown]
+The learning rate decays during the stable block as the posterior variance $w$ shrinks, and rises after each reversal as the volatility estimate catches the jump in $m$ — qualitatively what Behrens et al. (2007) found in people and what Piray and Daw (2020) report for the model. The *size* of the effect is modest with 75/25 outcomes, because a quarter of the trials are surprising even when nothing changes; it grows when outcomes are less noisy or reversals more frequent. This is a useful reminder for experiment design: the signal that volatility leaves in behaviour is only as strong as the contrast between the blocks.
+
+### ✏️ Exercise 12.6 — Which parameter learns volatility? *(conceptual)*
+
+Which VKF parameter determines how quickly the volatility estimate $v$ responds to a run of surprising outcomes?
+
+**(a)** $\omega$ (or $\sigma^2$), the noise parameter
+**(b)** $v_0$, the initial volatility
+**(c)** $\lambda$, the volatility update rate
+**(d)** $\beta$, the inverse temperature
+
+# %% [exercise 12.6]
+check("12.6", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+## 12.4 Fitting the VKF to choices
+
+To use the VKF as a model of a participant we need a likelihood (lesson 5). In a full-information task the outcome on every trial reveals which option paid, so the VKF's prediction $p_t = \sigma(m_{t-1})$ that option 0 pays can be computed from the outcome sequence alone. The choice rule turns the predicted probabilities of the two options, $p_t$ and $1 - p_t$, into a choice probability with a logistic function of their difference:
+
+$$
+P(\text{choose option 0 on trial } t) = \sigma\big(\beta\,[\,p_t - (1 - p_t)\,]\big) = \sigma\big(\beta\,(2 p_t - 1)\big),
+$$
+
+with inverse temperature $\beta$. The model has four parameters, $(\lambda, v_0, \omega, \beta)$. Piray and Daw (2020) used the same softmax structure (plus bias terms specific to their tasks).
+
+### ✏️ Exercise 12.7 — Likelihood of choices under the VKF *(coding)*
+
+Return the negative log-likelihood of `choices` (0 or 1) given `outcomes` (1 if option 0 paid) and `params = (lam, v0, omega, beta)`. Use `vkf_bin` to get the predictions.
+
+# %% [exercise 12.7]
+def vkf_bin_nll(params, outcomes, choices):
+    """Negative log-likelihood of binary choices under the VKF + logistic choice rule."""
+    lam, v0, omega, beta = params
+    pred = vkf_bin(outcomes, lam, v0, omega)["pred"]     # P(option 0 pays), before each trial
+    p0 = ...                                             # P(choose option 0) on each trial
+    choices = np.asarray(choices)
+    p_choice = ...                                       # probability of the choice actually made
+    return ...
+
+check("12.7", vkf_bin_nll)
+
+# %% [markdown]
+Let's simulate a VKF agent and fit it back. Because outcomes do not depend on choices in this design, simulating is easy: run the filter on the outcomes, then sample each choice from the choice rule. Following Piray and Daw (2020), who initialised their hierarchical fits with maximum-a-posteriori estimates under a broad Gaussian prior (mean 0, variance 6.25 in the unconstrained space of lesson 5), we add that weak prior to the fit; it stops the optimiser from running to degenerate corners such as $\omega \to 0$.
+
+# %%
+vkf_bin_nll = use("12.7", vkf_bin_nll)
+
+def simulate_vkf_agent(task, lam, v0, omega, beta, rng):
+    """Outcomes and choices of a VKF agent on a full-information reversal task."""
+    task.reset()
+    outcomes = np.array([task.step(0)[1] for _ in range(task.n_trials)])      # outcomes do not depend on the choice
+    pred = vkf_bin(outcomes, lam, v0, omega)["pred"]
+    p0 = sigmoid(beta * (2 * pred - 1))
+    choices = (rng.random(task.n_trials) >= p0).astype(int)                  # 0 with probability p0
+    return outcomes, choices
+
+KINDS = ["unit", "pos", "pos", "pos"]                        # lam in (0,1); v0, omega, beta > 0
+weak_prior = fitting.normal_log_prior(np.zeros(4), np.full(4, 2.5))
+
+true_params = (0.2, 0.1, 0.1, 4.0)
+sim_task = tasks.ReversalTask.stable_volatile(rng=rng)
+sim_outcomes, sim_choices = simulate_vkf_agent(sim_task, *true_params, rng)
+fit = fitting.fit_mle(vkf_bin_nll, (sim_outcomes, sim_choices), KINDS, n_starts=3, rng=rng, log_prior=weak_prior)
+for name, true, est in zip(["lam", "v0", "omega", "beta"], true_params, fit["params"]):
+    print(f"{name:6s} true {true:5.2f}   fitted {est:5.2f}")
+print(f"negative log-likelihood at the fit: {fit['nll']:.1f}  (chance level: {sim_task.n_trials * np.log(2):.1f})")
+
+# %% [markdown]
+The fit beats chance comfortably, but the parameters are not all recovered well. Lesson 6 taught us to ask this question systematically, so let's recover $\lambda$ across ten simulated participants.
+
+# %%
+true_lams, fitted_lams, trace_corr = [], [], []
+for i in range(10):
+    lam_i = rng.uniform(0.05, 0.6)
+    t = tasks.ReversalTask.stable_volatile(rng=rng)
+    o, c = simulate_vkf_agent(t, lam_i, 0.1, 0.1, 4.0, rng)
+    f = fitting.fit_mle(vkf_bin_nll, (o, c), KINDS, n_starts=2, rng=rng, log_prior=weak_prior)
+    true_lams.append(lam_i); fitted_lams.append(f["params"][0])
+    alpha_true = vkf_bin(o, lam_i, 0.1, 0.1)["alpha"]                 # the learning-rate signal the agent really used
+    alpha_fit = vkf_bin(o, *f["params"][:3])["alpha"]                  # the one implied by the fitted parameters
+    trace_corr.append(np.corrcoef(alpha_true, alpha_fit)[0, 1])
+
+fig, ax = plt.subplots(figsize=(4.2, 3.8))
+ax.scatter(true_lams, fitted_lams, s=30)
+ax.plot([0, 1], [0, 1], ls="--", color="#52514e", lw=1)
+ax.set(xlabel="true λ", ylabel="fitted λ", xlim=(0, 1), ylim=(0, 1), title=f"Recovery of λ (r = {np.corrcoef(true_lams, fitted_lams)[0, 1]:.2f})")
+plt.show()
+print(f"correlation between the true and the fitted learning-rate trajectories: mean r = {np.mean(trace_corr):.2f}")
+
+# %% [markdown]
+With 240 trials of a 75/25 task, $\lambda$ is essentially **not recoverable**, even though the fitted model reproduces the trial-by-trial learning rate reasonably well: different combinations of $\lambda$, $v_0$ and $\omega$ produce similar learning-rate trajectories and therefore similar choices. Piray and Daw (2020) note the same thing — in their recovery analysis "estimation of the volatility learning rate and initial volatility were more prone to error" — and they fit their experiments with hierarchical Bayesian inference (HBI; lesson 8), which stabilises weakly identified parameters by pooling across participants. The lesson for practice: a parameter being *in the model* does not make it *measurable in your design*; check recovery before interpreting individual differences in $\lambda$ (lesson 14 returns to this).
+
+### Does the VKF describe these participants better than a fixed learning rate?
+
+The data set `reversal_anxiety` contains 60 simulated participants on the Behrens design. We compare the VKF with the fixed-learning-rate Rescorla–Wagner tracker of the same quantity (`models.rw_reversal_nll`, two parameters) using the BIC of lesson 7, for six participants.
+
+# %%
+from rlcourse import datasets
+trials, subjects = datasets.load("reversal_anxiety")
+print(datasets.describe("reversal_anxiety"))
+print(trials.head())
+
+# %%
+print(f"{'subject':>7s} {'BIC VKF':>9s} {'BIC RW':>8s}   preferred")
+for s in range(6):
+    d = trials[trials.subject == s]
+    o, c = d.outcome.to_numpy(), d.choice.to_numpy()
+    f_vkf = fitting.fit_mle(vkf_bin_nll, (o, c), KINDS, n_starts=3, rng=rng, log_prior=weak_prior)
+    f_rw = fitting.fit_mle(models.rw_reversal_nll, (o, c), ["unit", "pos"], n_starts=3, rng=rng)
+    bic_vkf, bic_rw = fitting.bic(f_vkf["nll"], 4, len(o)), fitting.bic(f_rw["nll"], 2, len(o))
+    print(f"{s:7d} {bic_vkf:9.1f} {bic_rw:8.1f}   {'VKF' if bic_vkf < bic_rw else 'RW'}")
+
+# %% [markdown]
+For most of these participants the two-parameter model wins: their behaviour was generated with a learning rate that changes only *between* blocks, and the VKF's extra flexibility costs two parameters. Where a participant's adaptation is large, the VKF wins. Model comparison does not tell you which model is "true"; it tells you which description of *this* behaviour is parsimonious (lesson 7).
+
+## 12.5 Measuring learning-rate adaptation per participant
+
+The most direct way to quantify whether a participant adapts to volatility is the one Behrens et al. (2007) and Browning et al. (2015) used: fit a fixed-learning-rate model **separately to each block** and compare the two learning rates.
+
+### ✏️ Exercise 12.8 — Learning rates per block *(coding)*
+
+Fit `models.rw_reversal_nll` (parameters `(alpha, beta)`, kinds `["unit", "pos"]`) separately to the stable and the volatile trials, with `fitting.fit_mle(..., n_starts=3, rng=rng)`, and return `(alpha_stable, alpha_volatile)`. `block` is an array of strings (`"stable"` / `"volatile"`), one per trial.
+
+# %% [exercise 12.8]
+def fit_block_learning_rates(outcomes, choices, block, rng):
+    """Return (alpha_stable, alpha_volatile) from separate RW fits to the two blocks."""
+    outcomes, choices, block = np.asarray(outcomes), np.asarray(choices), np.asarray(block)
+    raise NotImplementedError("your code here: mask each block, fit, collect params[0]")
+
+check("12.8", fit_block_learning_rates)
+
+# %%
+fit_block_learning_rates = use("12.8", fit_block_learning_rates)
+
+alphas = []
+for s in range(10):
+    d = trials[trials.subject == s]
+    alphas.append(fit_block_learning_rates(d.outcome.to_numpy(), d.choice.to_numpy(), d.block.to_numpy(), rng))
+alphas = np.array(alphas)
+
+fig, ax = plt.subplots(figsize=(4.4, 4))
+ax.scatter(alphas[:, 0], alphas[:, 1], s=36)
+ax.plot([0, 1], [0, 1], ls="--", color="#52514e", lw=1, label="no adaptation")
+ax.set(xlabel="α in the stable block", ylabel="α in the volatile block", xlim=(0, 0.8), ylim=(0, 0.8),
+       title="Learning-rate adaptation (10 participants)")
+ax.legend()
+plt.show()
+print(f"{np.mean(alphas[:, 1] > alphas[:, 0]):.0%} of participants have a higher learning rate in the volatile block")
+
+# %% [markdown]
+Most points lie above the diagonal: like Behrens' participants, these learners speed up when the world becomes volatile. Browning et al. (2015) found that this adaptation is *reduced* in people with high trait anxiety, and Gagne et al. (2020) replicated and extended the finding to internalising symptoms more broadly; Pulcu and Browning (2019) argue that a misestimation of uncertainty of this kind is a core computational feature of affective disorders. Lesson 14 tests the relation between adaptation and anxiety on the whole data set.
+
+## 12.6 The wider family: the HGF and other volatility models
+
+The VKF is one of several models in which learning rates are driven by estimated uncertainty:
+
+- **The Bayesian ideal observer of Behrens et al. (2007)** represents, on a grid, the joint posterior over the reward probability, its volatility and the volatility's own rate of change. It is exact but expensive, and it is what the VKF approximates with closed-form updates (lesson 11's change-point filter is a two-level cousin).
+- **The hierarchical Gaussian filter (HGF; Mathys et al., 2011, 2014)** stacks Gaussian random walks: the outcome tendency (level 1–2) drifts with a step size governed by a log-volatility (level 3) that itself drifts. Variational inference yields updates in which each level is corrected by a *precision-weighted prediction error* from the level below. The HGF has parameters for the coupling between levels ($\kappa$), the baseline log-volatility ($\omega$) and the meta-volatility ($\vartheta$), and is implemented in the TAPAS toolbox (Frässle et al., 2021) and in the Python package `pyhgf`. Piray and Daw (2020) show that the VKF is a simpler, better-behaved alternative with the same qualitative behaviour, and compare the two on data.
+- **The approximately Bayesian delta rule of Nassar et al. (2010)** adapts the learning rate to the estimated probability that a change-point has just occurred, for environments that jump rather than drift.
+- **Joint stochasticity–volatility learning (Piray & Daw, 2021)** extends the VKF to estimate the noise $\sigma^2$ as well, resolving the ambiguity of Exercise 12.10 in a principled way.
+
+All of them share the lesson of this chapter: the learning rate is a *statistic of the environment*, estimated online, not a fixed trait of the learner.
+
+### ✏️ Exercise 12.9 — How the VKF's learning rate behaves *(conceptual)*
+
+Which statement about the binary VKF's learning rate $\alpha_t = \sqrt{w_t + v_t}$ is correct?
+
+**(a)** It is constant across trials once the filter has been initialised.
+**(b)** It rises when the volatility estimate $v$ rises after a run of surprising outcomes, and falls as the posterior variance $w$ shrinks during a stable run.
+**(c)** It depends only on the most recent prediction error.
+**(d)** It is equal to the volatility update rate $\lambda$.
+
+# %% [exercise 12.9]
+check("12.9", None)   # <- replace None with "a", "b", "c" or "d"
+
+# %% [markdown]
+### ✏️ Exercise 12.10 — Noise versus volatility *(conceptual, written)*
+
+In 3–5 sentences: why do outcome noise and volatility have *opposite* effects on the learning rate an ideal learner should use? (Hint: look at where $v$ and $\sigma^2$ sit in the Kalman gain.)
+
+# %% [exercise 12.10]
+check("12.10", """
+    Write your answer here.
+""")
+
+# %% [markdown]
+## Summary
+
+- **Noise** (unexpected outcomes from an unchanged process) calls for a *low* learning rate; **volatility** (change of the process) calls for a *high* one. People raise their learning rate in volatile environments (Behrens et al., 2007).
+- The **VKF** (Piray & Daw, 2020) is a Kalman filter whose process noise $v$ is learned by a delta rule on the posterior expected squared change of the hidden state (Eq. 13); $\lambda$ is the volatility update rate. The binary version tracks a logit with learning rate $\alpha_t = \sqrt{w_t + v_t}$.
+- The VKF's volatility estimate and learning rate rise in volatile stretches and decay in stable ones; the size of the effect depends on how much change there is relative to noise, and the volatility estimate never falls to zero.
+- Fitting the VKF to choices works, but $\lambda$ and $v_0$ are weakly identified in short tasks — check recovery, use hierarchical priors, and do not over-interpret individual differences in them.
+- The simplest measure of adaptation is a learning rate fitted separately per block; its reduction in anxiety is a well-replicated finding (Browning et al., 2015; Gagne et al., 2020).
+- The HGF, Behrens' ideal observer and change-point models are the VKF's relatives; all treat the learning rate as an estimated property of the environment.
+
+## What's next
+
+Lesson 13 changes the question from *how fast* to learn to *what* to learn: instead of a single expected value, distributional reinforcement learning tracks the whole distribution of outcomes — and asymmetric learning rates turn out to be the mechanism. Lesson 14 then uses this lesson's per-block learning rates to study anxiety.
+
+## References
+
+- Behrens, T. E. J., Woolrich, M. W., Walton, M. E., & Rushworth, M. F. S. (2007). Learning the value of information in an uncertain world. *Nature Neuroscience, 10*, 1214–1221. https://doi.org/10.1038/nn1954
+- Browning, M., Behrens, T. E., Jocham, G., O'Reilly, J. X., & Bishop, S. J. (2015). Anxious individuals have difficulty learning the causal statistics of aversive environments. *Nature Neuroscience, 18*, 590–596. https://doi.org/10.1038/nn.3961
+- Frässle, S., Aponte, E. A., Bollmann, S., Brodersen, K. H., Do, C. T., Harrison, O. K., … Stephan, K. E. (2021). TAPAS: An open-source software package for translational neuromodeling and computational psychiatry. *Frontiers in Psychiatry, 12*, 680811. https://doi.org/10.3389/fpsyt.2021.680811
+- Gagne, C., Zika, O., Dayan, P., & Bishop, S. J. (2020). Impaired adaptation of learning to contingency volatility in internalizing psychopathology. *eLife, 9*, e61387. https://doi.org/10.7554/eLife.61387
+- Kalman, R. E. (1960). A new approach to linear filtering and prediction problems. *Journal of Basic Engineering, 82*(1), 35–45. https://doi.org/10.1115/1.3662552
+- Mathys, C., Daunizeau, J., Friston, K. J., & Stephan, K. E. (2011). A Bayesian foundation for individual learning under uncertainty. *Frontiers in Human Neuroscience, 5*, 39. https://doi.org/10.3389/fnhum.2011.00039
+- Mathys, C. D., Lomakina, E. I., Daunizeau, J., Iglesias, S., Brodersen, K. H., Friston, K. J., & Stephan, K. E. (2014). Uncertainty in perception and the Hierarchical Gaussian Filter. *Frontiers in Human Neuroscience, 8*, 825. https://doi.org/10.3389/fnhum.2014.00825
+- Nassar, M. R., Wilson, R. C., Heasly, B., & Gold, J. I. (2010). An approximately Bayesian delta-rule model explains the dynamics of belief updating in a changing environment. *Journal of Neuroscience, 30*(37), 12366–12378. https://doi.org/10.1523/JNEUROSCI.0822-10.2010
+- Piray, P., & Daw, N. D. (2020). A simple model for learning in volatile environments. *PLoS Computational Biology, 16*(7), e1007963. https://doi.org/10.1371/journal.pcbi.1007963 — reference code: https://github.com/payampiray/VKF
+- Piray, P., & Daw, N. D. (2021). A model for learning based on the joint estimation of stochasticity and volatility. *Nature Communications, 12*, 6587. https://doi.org/10.1038/s41467-021-26731-9
+- Pulcu, E., & Browning, M. (2019). The misestimation of uncertainty in affective disorders. *Trends in Cognitive Sciences, 23*(10), 865–875. https://doi.org/10.1016/j.tics.2019.07.007
+- Yu, A. J., & Dayan, P. (2005). Uncertainty, neuromodulation, and attention. *Neuron, 46*(4), 681–692. https://doi.org/10.1016/j.neuron.2005.04.026

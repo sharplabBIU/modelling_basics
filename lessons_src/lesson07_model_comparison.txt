@@ -356,7 +356,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-The x-axis labels of the left panel show which model actually generated each participant's data (the first three letters), so you can see that the per-participant posteriors mostly land on the right model. At the group level the expected frequencies recover the mixture (roughly 60% RW, 25% WSLS, 15% asymmetric), and the exceedance probability says that RW is almost certainly the most common model — a correct conclusion that a fixed-effects analysis would have expressed only as "RW wins", hiding the fact that a quarter of the group does something else.
+The x-axis labels of the left panel show which model actually generated each participant's data (the first three letters), so you can see that the per-participant posteriors mostly land on the right model. At the group level the expected frequencies approximate the mixture (RW ≈ 0.6, WSLS ≈ 0.3), although the small asymmetric subgroup is largely absorbed by the simpler models — with 150 trials its extra parameter is rarely worth the BIC penalty — and the exceedance probability says that RW is almost certainly the most common model. A fixed-effects analysis would have expressed the same result only as "RW wins", hiding the fact that a third of the group does something else.
 
 ### When the exceedance probability misleads
 

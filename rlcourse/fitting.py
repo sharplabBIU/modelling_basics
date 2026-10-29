@@ -96,8 +96,10 @@ def fit_mle(nll, data_args, kinds, n_starts=10, rng=None, x0_sd=1.5, method="L-B
         res = optimize.minimize(objective, x0, method=method)
         if best is None or res.fun < best.fun:
             best = res
-    theta = to_constrained(best.x, kinds)
-    return {"params": theta, "x": best.x, "nll": float(nll(theta, *data_args)),
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        theta = to_constrained(best.x, kinds)
+        final_nll = float(nll(theta, *data_args))
+    return {"params": theta, "x": best.x, "nll": final_nll,
             "objective": float(best.fun), "success": bool(best.success), "result": best}
 
 

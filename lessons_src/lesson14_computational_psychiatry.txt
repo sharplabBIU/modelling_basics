@@ -28,7 +28,8 @@ from rlcourse import models, tasks, fitting, plotting
 setup_style()
 rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
 
-import pandas as pd
+# %%
+import pandas as pd                      # this lesson also needs pandas, scipy.stats, statsmodels and the data sets
 import warnings
 from scipy import stats
 import statsmodels.api as sm
@@ -444,9 +445,9 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-Same data, same model, different analysis: the naive estimates of $\beta$ are essentially unreliable and those of $\alpha^+$ poor, whereas interleaved blocks with a weak prior roughly double the reliability of $\alpha^+$ and make $\beta$ usable. This is the practical content of Brown et al. (2020) and Zorowitz & Niv (2023): reliability is a property of the whole pipeline, and hierarchical or regularised estimation is often the cheapest improvement available. Even the better numbers are moderate — in a clean simulation without lapses of attention, strategy changes or questionnaire noise — so any real parameter–symptom correlation has to be read against this ceiling.
+Same data, same model, different analysis: the naive estimates are poor for all three parameters, whereas interleaved blocks with a weak prior nearly double the reliability of $\alpha^+$ and make $\beta$ usable. This is the practical content of Brown et al. (2020) and Zorowitz & Niv (2023): reliability is a property of the whole pipeline, and hierarchical or regularised estimation is often the cheapest improvement available. Even the better numbers are moderate — in a clean simulation without lapses of attention, strategy changes or questionnaire noise — so any real parameter–symptom correlation has to be read against this ceiling.
 
-### ✏️ Exercise 14.9 — Reading a reliability estimate *(conceptual)*
+### ✏️ Exercise 14.8 — Reading a reliability estimate *(conceptual)*
 
 The split-half reliability of fitted $w$ in a design is 0.4 (and the symptom questionnaire's reliability is about 0.9). Which statement follows?
 
@@ -455,19 +456,19 @@ The split-half reliability of fitted $w$ in a design is 0.4 (and the symptom que
 **(c)** The true correlation between $w$ and the symptom must be smaller than 0.4.
 **(d)** Nothing can raise the reliability: it is a fixed property of the parameter.
 
-# %% [exercise 14.9]
-check("14.9", None)   # <- replace None with "a", "b", "c" or "d"
+# %% [exercise 14.8]
+check("14.8", None)   # <- replace None with "a", "b", "c" or "d"
 
 # %% [markdown]
 ## 14.6 Power by simulation
 
 How many participants does a parameter–symptom study need? For a plain correlation there are formulas, but the honest answer for a *model-based* analysis comes from simulation: generate participants from the model with the hypothesised relation built in, fit them, run the planned test, and count how often it is significant. That includes the estimation noise automatically. The exercise implements the core step for a correlation; the "full pipeline" version just replaces the bivariate normal draw with "simulate and fit".
 
-### ✏️ Exercise 14.8 — Power by simulation *(coding)*
+### ✏️ Exercise 14.9 — Power by simulation *(coding)*
 
 Estimate the power of a Pearson correlation test: draw `n_sims` samples of `n` bivariate-normal pairs with correlation `r_true`, test each with `scipy.stats.pearsonr`, and return the proportion of samples with $p <$ `alpha`.
 
-# %% [exercise 14.8]
+# %% [exercise 14.9]
 def power_by_simulation(r_true, n, n_sims, rng, alpha=0.05):
     """Proportion of simulated samples (n pairs with correlation r_true) in which pearsonr gives p < alpha."""
     cov = np.array([[1.0, r_true], [r_true, 1.0]])
@@ -477,10 +478,10 @@ def power_by_simulation(r_true, n, n_sims, rng, alpha=0.05):
         raise NotImplementedError("test the sample and count it if significant")
     return n_significant / n_sims
 
-check("14.8", power_by_simulation)
+check("14.9", power_by_simulation)
 
 # %%
-power_by_simulation = use("14.8", power_by_simulation)
+power_by_simulation = use("14.9", power_by_simulation)
 
 ns = [20, 40, 60, 100, 150, 200]
 fig, ax = plt.subplots(figsize=(6.5, 3.8))
@@ -558,6 +559,8 @@ else:
     print("Skipped: PyMC / numpyro / arviz not installed (pip install pymc numpyro arviz to run this cell).")
 
 # %% [markdown]
+Read `b_anh` as the regression coefficient of lesson 14.3, but with its uncertainty inherited from every participant's trial-by-trial likelihood rather than from point estimates. (This quick sketch — two short chains, a centred parameterisation — reports a few divergences and R-hat values slightly above 1; a publication-grade version would use a non-centred parameterisation, four chains and more draws, as in lesson 8.)
+
 **Groups versus dimensions.** Comparing a patient group with controls on a parameter is the classic design, but diagnoses are heterogeneous; dimensional, transdiagnostic analyses (Gillan et al., 2016) often have more power and clearer interpretation. If you do compare groups, fit them *in one* hierarchical model with group as a predictor rather than fitting each group separately with its own prior.
 
 **Deficit versus dysregulation.** "Lower learning rate" is only a deficit if a higher one would do better in the task. Sharp, Dolan & Eldar (2023) found that compulsivity was associated with state-transition learning rates that were *poorly adapted* to the environment (too fast in one task, too slow in another) — a statement about regulation that a single-task deficit framing would miss. The same applies to Browning et al.'s anxiety result.

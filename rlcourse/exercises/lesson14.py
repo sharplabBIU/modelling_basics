@@ -329,9 +329,9 @@ EXERCISES = [
                     "(Brown et al. 2020; Zorowitz & Niv 2023).",
         check_call='check("14.7", np.sqrt(0.5 * 0.8))',
     ),
-    # ------------------------------------------------------------------ 14.8
+    # ------------------------------------------------------------------ 14.9
     CodeExercise(
-        id="14.8", title="Power by simulation",
+        id="14.9", title="Power by simulation",
         reference=power_by_simulation,
         signature="power_by_simulation(r_true, n, n_sims, rng, alpha=0.05)",
         cases=[{"r_true": 0.3, "n": 60, "n_sims": 300, "rng": np.random.default_rng(145)},
@@ -349,11 +349,11 @@ EXERCISES = [
                     "by parameter estimation.",
         common_mistakes="Returning a count instead of a proportion; comparing r instead of p with the threshold; "
                         "re-using the same sample in every iteration.",
-        check_call='check("14.8", power_by_simulation)',
+        check_call='check("14.9", power_by_simulation)',
     ),
-    # ------------------------------------------------------------------ 14.9
+    # ------------------------------------------------------------------ 14.8
     ChoiceExercise(
-        id="14.9", title="Reading a reliability estimate",
+        id="14.8", title="Reading a reliability estimate",
         question="The split-half reliability of fitted w in a design is 0.4 (and the symptom questionnaire's reliability is about 0.9). Which statement follows?",
         options={"a": "Even a perfect true relation between w and the symptom would be expected to appear as r ≈ 0.6 at most; small observed correlations are not surprising.",
                  "b": "w is useless as an individual-differences measure and should be abandoned.",
@@ -369,7 +369,7 @@ EXERCISES = [
         explanation="Reliability caps the observable correlation at sqrt(rel_x × rel_y) ≈ 0.6 here. The remedies are "
                     "design-side (more trials, repeated sessions, tasks tuned for individual differences; Zorowitz & "
                     "Niv 2023) and estimation-side (hierarchical models; Brown et al. 2020).",
-        check_call='check("14.9", "a")',
+        check_call='check("14.8", "a")',
     ),
     # ------------------------------------------------------------------ 14.10
     FreeTextExercise(

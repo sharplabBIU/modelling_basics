@@ -183,15 +183,15 @@ plt.show()
 # %% [markdown]
 The bright region is elongated along a diagonal: a higher learning rate with a lower inverse temperature produces choices that look much like a lower learning rate with a higher inverse temperature — both make the agent somewhat less consistent in choosing the better option. With few trials the estimate can land anywhere along the ridge.
 
-A second diagnostic uses the recovery study itself. The true parameters were drawn **independently**, so any correlation between the *recovered* α and log β must have been produced by the estimation — a tell-tale sign of a trade-off. (Boundary fits are excluded, as before.)
+A second diagnostic uses the recovery study itself: look at the **estimation errors** (recovered − true) of the two parameters. The errors do not depend on the true values, so if they are correlated across subjects the estimation itself is coupling the parameters — the ridge, seen across subjects. (Boundary fits are excluded, as before.)
 
 # %%
-r_true = np.corrcoef(true_log[ok, 0], true_log[ok, 1])[0, 1]
-r_recovered = np.corrcoef(rec_log[ok, 0], rec_log[ok, 1])[0, 1]
-print(f"correlation between alpha and log(beta):  true parameters r = {r_true:+.2f},  recovered r = {r_recovered:+.2f}")
+errors = rec_log[ok] - true_log[ok]
+r_errors = np.corrcoef(errors[:, 0], errors[:, 1])[0, 1]
+print(f"correlation between the estimation errors of alpha and log(beta): r = {r_errors:+.2f}")
 
 # %% [markdown]
-The recovered parameters are negatively correlated although the true ones are not — the ridge of the likelihood surface, seen across subjects. With 150 trials the effect is modest; with fewer trials it grows.
+The errors are negatively correlated: when α is over-estimated, β tends to be under-estimated, as the orientation of the ridge predicts. With 30 subjects and 150 trials the signature is faint and it varies from run to run — the likelihood surface is the more reliable way to see a trade-off — but when it is strong it is a warning that the two parameters cannot be interpreted independently.
 
 ### What improves identifiability?
 
@@ -229,7 +229,7 @@ plt.show()
 # %% [markdown]
 With only 20 simulated subjects per bar the exact numbers change from run to run — re-run the cell with another seed and look at the pattern, not the digits. Three lessons are robust:
 
-- **More trials help**, and not only by reducing noise: with 40 trials a sizeable fraction of the fits run away to the boundary, because short sequences are often perfectly consistent with a deterministic policy.
+- **More trials help**, and not only by reducing noise: boundary fits are more frequent with few trials (with 40 trials typically 10–30% of the fits run away), because short sequences are often perfectly consistent with a deterministic policy.
 - **A very easy task recovers the learning rate poorly.** Once the better option is obvious, the values stop changing in a way that depends on α and the choices saturate at the better option, so most trials carry no information about either parameter. Difficulty and informativeness are not the same thing.
 - **Moderate changes in reward probabilities matter less than you might expect.** In the 0.7/0.3 and 0.55/0.45 designs the reward noise keeps the values fluctuating, and those fluctuations keep both parameters identifiable.
 

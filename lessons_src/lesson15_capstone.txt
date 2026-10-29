@@ -18,6 +18,13 @@ This is where the course comes together. You will take a data set from the first
 7. Posterior predictive check
 8. Write-up, limitations, and the reveal
 
+**What you will learn**
+
+- how to run the complete modelling pipeline of the course on one data set, in the order a real project uses it,
+- how to work out what a model comparison can and cannot tell you in a given design (and to calibrate it with model recovery),
+- how to report a parameter–symptom relation with its specificity, covariates, reliability and attenuation,
+- how to write up a computational analysis — and how it compares with a known ground truth.
+
 **Prerequisites:** lessons 1–14 (especially 5–7, 13 and 14).
 
 **Estimated time:** 3–4 hours.
@@ -31,7 +38,8 @@ from rlcourse import models, tasks, fitting, plotting
 setup_style()
 rng = np.random.default_rng(2024)        # one seed per notebook: results are reproducible
 
-import pandas as pd
+# %%
+import pandas as pd                      # this lesson also needs pandas, scipy.stats, the data sets and two lesson-14 tools
 from scipy import stats
 from rlcourse import datasets
 from rlcourse.exercises.lesson14 import symptom_regression, split_half_reliability   # the tools you wrote in lesson 14
@@ -229,6 +237,10 @@ for i, true_model in enumerate(model_names):
         best_bic[i, int(np.argmin(bics))] += 1
         best_aic[i, int(np.argmin(aics))] += 1
 confusion_bic, confusion_aic = best_bic / n_sims, best_aic / n_sims
+print("P(winning model | simulated model) under BIC (rows: simulated):")
+display(pd.DataFrame(confusion_bic, index=model_names, columns=model_names).round(2))
+print("... and under AIC:")
+display(pd.DataFrame(confusion_aic, index=model_names, columns=model_names).round(2))
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
 plotting.plot_confusion(confusion_bic, model_names, ax=axes[0], title="Model recovery with BIC\n(rows: simulated model, cols: winner)")
@@ -237,7 +249,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-Look at the `rw_asym` row. With 160 trials and the modest asymmetries typical of our sample, BIC's penalty ($\ln 160 \approx 5.1$ per parameter) almost never lets the asymmetric model win *even when it generated the data*; AIC (penalty 2) detects it somewhat more often, but at the cost of frequently preferring `rw_asym` for data that plain RW generated. Neither criterion can adjudicate between RW and asymmetric RW in this design. This is the single most important fact for interpreting milestone 4: **a win for `rw` is not evidence against asymmetry** (and under AIC a win for `rw_asym` is only weak evidence for it). The comparison is informative about the other models — the no-learning and rule-based models are recovered well and lose clearly.
+Look at the `rw_asym` row. With 160 trials and the modest asymmetries typical of our sample, BIC's penalty ($\ln 160 \approx 5.1$ per parameter) rarely lets the asymmetric model win *even when it generated the data*; AIC (penalty 2) detects it somewhat more often, but at the cost of frequently preferring `rw_asym` for data that plain RW generated. Neither criterion can adjudicate between RW and asymmetric RW in this design. This is the single most important fact for interpreting milestone 4: **a win for `rw` is not evidence against asymmetry** (and under AIC a win for `rw_asym` is only weak evidence for it). The comparison is informative about the other models — the no-learning and rule-based models are recovered well and lose clearly.
 
 ### ✏️ Exercise 15.3 — Reading the model-recovery matrix *(conceptual)*
 
@@ -309,7 +321,7 @@ print("correlations among the *generating* parameters:")
 print(pd.DataFrame(np.c_[true_params[:, :2], np.log(true_params[:, 2])], columns=["α⁺", "α⁻", "log β"]).corr().round(2))
 
 # %% [markdown]
-$\alpha^+$ recovers reasonably, $\alpha^-$ less well, and the recovered $\alpha^+$ and $\log\beta$ are clearly negatively correlated — more so than the generating values. That excess is the estimation trade-off of lesson 14: fast learning from rewards and deterministic choice produce similar data. For the symptom analysis this means two things: report the relation of *every* parameter to the symptom (if anhedonia related to $\beta$ as well, the $\alpha^+$ result would be suspect), and prefer regularised or hierarchical estimates when you can.
+$\alpha^+$ recovers reasonably, $\alpha^-$ less well, and the recovered $\alpha^+$ and $\log\beta$ are negatively correlated. Be careful with the second matrix: the generating parameters were *resampled from the fitted values*, so they inherit whatever trade-off the fits already contain — this comparison cannot separate a real correlation from an artefactual one. Lesson 14 could, because there the true values were known to be independent, and the fitted $\alpha^+$ and $\beta$ nevertheless correlated at $\rho \approx -0.5$: fast learning from rewards and deterministic choice produce similar data. For the symptom analysis this means two things: report the relation of *every* parameter to the symptom (if anhedonia related to $\beta$ as well, the $\alpha^+$ result would be suspect), and prefer regularised or hierarchical estimates when you can.
 
 # %% [markdown]
 ### ✏️ Exercise 15.5 — Interpreting parameter recovery before the symptom analysis *(conceptual)*
@@ -537,6 +549,14 @@ Repeat the pipeline on the other two data sets; each has its own twist:
 ## Summary
 
 You have run a complete computational-psychiatry pipeline: model-agnostic description → candidate models → model recovery → model comparison → parameter recovery → symptom analysis with specificity, covariates, reliability and attenuation → posterior predictive check → write-up. Two lessons stand out: *the design limits what any comparison can detect* (calibrate the comparison with model recovery), and *estimation noise attenuates every correlation* (measure reliability and say so).
+
+## What's next
+
+You now have the whole toolkit. Three directions from here:
+
+- **Your own data.** Replace `datasets.load(...)` with your task's trials table and run the same milestones. The recovery and reliability checks are the steps most often skipped and most often decisive.
+- **Hierarchical estimation.** Refit the winning model with the empirical-Bayes EM of lesson 8, or the PyMC model of lesson 14 with the symptom score embedded, and see how much the reliability and the attenuation gap change.
+- **Keep reading.** `docs/READING_LIST.md` collects every source of the course by topic; Wilson & Collins (2019) and Daw (2011) are the two to re-read now that you have done it all once.
 
 ## References
 

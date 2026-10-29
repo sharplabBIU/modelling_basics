@@ -65,6 +65,8 @@ def plot_parameter_recovery(true, fitted, names, axes=None, identity: bool = Tru
         ax.set_title(f"{name}:  r = {r:.2f}")
         ax.set_xlabel(f"true {name}")
         ax.set_ylabel(f"recovered {name}")
+        if identity:
+            ax.legend(fontsize=8, loc="upper left")
     plt.tight_layout()
     return axes
 
